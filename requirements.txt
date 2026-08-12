@@ -1,0 +1,9 @@
+# League-Aware Fantasy Football Mock Draft — runtime dependencies
+streamlit>=1.36
+pandas>=2.1
+numpy>=1.26
+plotly>=5.20
+SQLAlchemy>=2.0
+openpyxl>=3.1          # .xlsx reading
+XlsxWriter>=3.1        # .xlsx export
+pytest>=8.0            # test suite

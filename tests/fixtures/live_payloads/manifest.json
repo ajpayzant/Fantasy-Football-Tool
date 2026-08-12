@@ -1,0 +1,26 @@
+{
+  "season": 2026,
+  "scoring": "half_ppr",
+  "team_count": 12,
+  "ffc_cache_key": "ffc_adp_half-ppr_12_2026",
+  "yahoo_pages": 12,
+  "fixtures": [
+    "espn_players_2026_PPR",
+    "ffc_adp_half-ppr_12_2026",
+    "sleeper_players_nfl",
+    "sleeper_state",
+    "yahoo_draft_analysis_0_25",
+    "yahoo_draft_analysis_100_25",
+    "yahoo_draft_analysis_125_25",
+    "yahoo_draft_analysis_150_25",
+    "yahoo_draft_analysis_175_25",
+    "yahoo_draft_analysis_200_25",
+    "yahoo_draft_analysis_225_25",
+    "yahoo_draft_analysis_250_25",
+    "yahoo_draft_analysis_25_25",
+    "yahoo_draft_analysis_275_25",
+    "yahoo_draft_analysis_50_25",
+    "yahoo_draft_analysis_75_25"
+  ],
+  "note": "Recorded from real provider responses by scripts/record_live_fixtures.py. Trimmed by row count only; every field of every kept record is verbatim."
+}
