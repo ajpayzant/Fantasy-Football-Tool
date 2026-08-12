@@ -25,6 +25,7 @@ from core.constants import (
     PLAYER_REQUIRED_COLUMNS,
     SAMPLE_DATA_BANNER,
 )
+from core import stats as core_stats
 from core.enums import InjuryStatus, Platform, Position
 from core.validation import (
     ValidationReport,
@@ -505,6 +506,10 @@ def import_player_pool(
                 adp_stdev_is_estimated=to_bool(raw.get("adp_stdev_is_estimated")),
                 projection_source=clean_text(raw.get("projection_source")),
                 projection_detail=clean_text(raw.get("projection_detail")),
+                # The stat line behind the projection, if the file carried one. This is
+                # what lets :meth:`PlayerPool.rescore` change scoring rules without
+                # going back to the network — see :mod:`core.stats`.
+                stat_totals=core_stats.from_frame_value(raw.get("stat_totals")),
             )
         )
 
@@ -560,6 +565,15 @@ def player_template() -> pd.DataFrame:
         "platform_adp": 2.1, "adp_stdev": 1.5, "min_pick": 1, "max_pick": 6,
         "tier": 1, "ceiling": 330.0, "floor": 210.0, "risk_score": 0.3,
         "value_over_replacement": 95.0, "notes": "",
+        # Optional, and the only column here that buys something the others cannot:
+        # supply the stat line and the app can rescore this player when the league's
+        # scoring changes. Supply only ``projection`` and it is frozen at whatever
+        # rules produced it. Field names are the canonical ones in :mod:`core.stats`.
+        "stat_totals": core_stats.to_frame_value({
+            "rush_attempts": 260.0, "rush_yards": 1180.0, "rush_td": 9.0,
+            "targets": 72.0, "receptions": 56.0, "rec_yards": 480.0, "rec_td": 3.0,
+            "fumbles_lost": 2.0, "games": 17.0,
+        }),
     }
     return pd.DataFrame([example], columns=list(PLAYER_IMPORT_COLUMNS))
 

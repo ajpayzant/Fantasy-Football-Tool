@@ -8,7 +8,8 @@ from typing import Any, Iterable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
-from core.config import LeagueConfig, RosterSettings
+from core import stats as core_stats
+from core.config import LeagueConfig, RosterSettings, ScoringRules
 from core.constants import SLOT_ELIGIBILITY, SLOT_FILL_PRIORITY
 from core.enums import InjuryStatus, Position, RankingSource, Slot
 
@@ -129,6 +130,22 @@ class Player:
     tier_source: str = ""
     outcome_band_source: str = ""
 
+    # The projected stat line this player's points were computed from, keyed by the
+    # canonical names in :mod:`core.stats`. Empty when no source supplied stats.
+    #
+    # This is what makes a projection re-derivable. ``projection`` is the answer under
+    # one particular set of scoring rules; these are the inputs, so changing from
+    # half-PPR to full PPR is arithmetic the app can do offline rather than a reason to
+    # re-download the season from ESPN.
+    stat_totals: dict[str, float] = field(default_factory=dict)
+    # True when ``projection`` was estimated from draft position rather than supplied.
+    # Needed for rescoring, not just for display: imputed projections are anchored to
+    # the range of the real ones, so when the real ones move to a new scoring scale the
+    # imputed ones have to be thrown away and re-derived, and this is how they are
+    # found. Matching on the wording of ``projection_source`` would work until someone
+    # rephrased it.
+    projection_imputed: bool = False
+
     def __post_init__(self) -> None:
         self.position = Position.coerce(self.position, Position.RB) or Position.RB
         self.injury_status = (
@@ -199,6 +216,54 @@ class Player:
         raw["injury_status"] = str(self.injury_status)
         raw["eligible_slots"] = [str(s) for s in self.eligible_slots]
         return raw
+
+
+def _s(count: int) -> str:
+    """"" or "s" — these counts are read by a person, and "1 estimates" reads badly."""
+    return "" if count == 1 else "s"
+
+
+@dataclass(slots=True)
+class RescoreOutcome:
+    """What :meth:`PlayerPool.rescore` actually managed to do.
+
+    Returned rather than logged because the honest answer is usually partial — ESPN
+    does not publish a stat line for every player it ranks — and a user changing
+    their scoring rules deserves to be told how much of the board really moved.
+    """
+
+    rescored: int = 0
+    """Players whose points were recomputed from their own stat line."""
+    reimputed: int = 0
+    """Players whose projection was an estimate and was re-derived on the new scale."""
+    no_stat_line: int = 0
+    """Players left untouched: a real projection with no stats behind it to redo."""
+    unscorable_rules: list[str] = field(default_factory=list)
+    """Scoring rules that cannot be applied to season totals at all."""
+
+    @property
+    def changed(self) -> int:
+        return self.rescored + self.reimputed
+
+    def describe(self) -> str:
+        if not self.changed:
+            return "No projections could be rescored — no stored stat lines to work from."
+        bits = [
+            f"{self.rescored} projection{_s(self.rescored)} recomputed from "
+            f"{'its' if self.rescored == 1 else 'their'} stat line"
+            f"{_s(self.rescored)}"
+        ]
+        if self.reimputed:
+            bits.append(
+                f"{self.reimputed} estimate{_s(self.reimputed)} re-derived on the "
+                "new scale"
+            )
+        if self.no_stat_line:
+            bits.append(
+                f"{self.no_stat_line} left as-is (a projection with no stat line "
+                "behind it cannot be rescored)"
+            )
+        return "; ".join(bits) + "."
 
 
 @dataclass(slots=True)
@@ -314,6 +379,92 @@ class PlayerPool:
         self._invalidate_caches()
         self._draft_order_hint = self._compute_order_hint()
 
+    def rescore(self, scoring: ScoringRules) -> RescoreOutcome:
+        """Recompute every projection from its stored stat line under ``scoring``.
+
+        This is what :attr:`Player.stat_totals` exists for. Before it, changing a
+        league from half-PPR to full PPR left every projection on the board scored
+        under the old rules, and the only remedy the app could offer was "download the
+        season from ESPN again" — a network round trip to recompute arithmetic from
+        numbers already in hand, and one that quietly returns *different* ADP because
+        ESPN's has moved in the meantime.
+
+        Three groups of players, handled differently on purpose, and tested in that
+        order because the first case must win over the second:
+
+        * **Has a scorable stat line.** Rescored. This is the whole point.
+        * **Projection was estimated from draft position.** Thrown away and re-derived,
+          not rescored — an imputed projection is a point on a curve fitted to the range
+          of the *real* projections, so it is only meaningful on the scale those are on.
+          A 6-point-passing-TD league moves the real quarterbacks up, and an estimate
+          left behind on the old scale would rank a nobody above them.
+        * **Real projection, no stat line.** Left exactly as it was. A user's CSV that
+          supplied only a points total is their number, and guessing at the stats behind
+          it to convert it would be inventing data. The return value says how many.
+
+        Derived tiers and outcome bands are cleared pool-wide and re-derived, because
+        both are read off the *position's* projection curve: one player moving changes
+        the curve every player at that position is placed on. Tiers and bands a source
+        supplied are kept — they are identifiable by an empty ``tier_source`` /
+        ``outcome_band_source``, which is only ever written when this app derived them.
+        """
+        outcome = RescoreOutcome(
+            unscorable_rules=core_stats.unscorable_rules(scoring)
+        )
+        for player in self._players:
+            points = (
+                core_stats.score(player.stat_totals, player.position, scoring)
+                if player.stat_totals else None
+            )
+            if points is not None:
+                # Stats are checked before the imputed flag, and the order is the whole
+                # correctness of this branch: a player who had no projection and has
+                # since been given a real stat line is no longer an estimate, and
+                # reading the flag first would throw those stats away.
+                player.projection = round(float(points), 1)
+                player.expected_points = player.projection
+                player.projection_imputed = False
+                player.projection_detail = core_stats.describe(
+                    player.stat_totals, player.position
+                )
+                outcome.rescored += 1
+                continue
+            if player.projection_imputed:
+                player.projection = None
+                player.expected_points = None
+                player.projection_source = ""
+                outcome.reimputed += 1
+                continue
+            # Either no stat line at all, or one that scores to nothing under these
+            # rules — a defence in a league that scores no defensive stats, say.
+            # Keeping the old number is wrong, but so is a confident zero, so leave it
+            # and report it rather than choosing between two wrong answers silently.
+            outcome.no_stat_line += 1
+
+        if not outcome.changed:
+            return outcome
+
+        for player in self._players:
+            if player.tier_source:
+                player.tier = None
+                player.tier_source = ""
+            if player.outcome_band_source:
+                # All three, not just the ones this app filled last time: ceiling, floor
+                # and risk are one statement about a player, and half of it on the old
+                # scoring scale would be worse than re-deriving all of it.
+                player.ceiling = None
+                player.floor = None
+                player.risk_score = None
+                player.outcome_band_source = ""
+
+        if self.league is not None:
+            self.apply_league(self.league)
+        else:
+            self._impute_core_fields()
+            self._invalidate_caches()
+            self._draft_order_hint = self._compute_order_hint()
+        return outcome
+
     def _impute_core_fields(self) -> None:
         """Fill missing rank/ADP/projection fields from whatever is present."""
         imputed: dict[str, int] = {}
@@ -383,6 +534,7 @@ class PlayerPool:
                 # Convex decay: elite players separate more than late-round ones.
                 player.projection = bottom + (top - bottom) * (1.0 - fraction) ** 1.8
                 bump(imputed, "projection")
+                player.projection_imputed = True
                 # Said plainly, because this is a restatement of draft position rather
                 # than an opinion about the player. A user comparing two projections
                 # needs to know when one of them is really just an ADP.
@@ -390,8 +542,13 @@ class PlayerPool:
                     "Estimated from draft position — no real projection was supplied "
                     "for this player"
                 )
-            elif not player.projection_source:
-                player.projection_source = "Supplied by your source"
+            else:
+                # Cleared, not left alone: a player who was imputed earlier and has
+                # since been given a real projection is no longer an estimate, and a
+                # stale flag would make :meth:`rescore` discard the real number.
+                player.projection_imputed = False
+                if not player.projection_source:
+                    player.projection_source = "Supplied by your source"
             if player.expected_points is None:
                 player.expected_points = player.projection
             if player.adp_stdev is None:
@@ -728,6 +885,8 @@ class PlayerPool:
                 "adp_stdev_is_estimated": player.adp_stdev_is_estimated,
                 "projection_source": player.projection_source,
                 "projection_detail": player.projection_detail,
+                "stat_totals": core_stats.to_frame_value(player.stat_totals),
+                "projection_imputed": player.projection_imputed,
                 "tier_source": player.tier_source,
                 "outcome_band_source": player.outcome_band_source,
                 "notes": player.notes,
@@ -815,6 +974,8 @@ def player_from_row(row: Any) -> Player:
         adp_stdev_is_estimated=to_bool(val("adp_stdev_is_estimated"), False),
         projection_source=str(val("projection_source", "") or ""),
         projection_detail=str(val("projection_detail", "") or ""),
+        stat_totals=core_stats.from_frame_value(val("stat_totals")),
+        projection_imputed=to_bool(val("projection_imputed"), False),
         tier_source=str(val("tier_source", "") or ""),
         outcome_band_source=str(val("outcome_band_source", "") or ""),
     )

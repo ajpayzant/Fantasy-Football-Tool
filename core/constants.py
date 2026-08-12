@@ -9,8 +9,13 @@ from __future__ import annotations
 from .enums import Position, Slot
 
 APP_NAME = "League-Aware Fantasy Mock Draft"
-SCHEMA_VERSION = 1
-"""Bumped whenever the SQLite schema changes; stored in ``application_settings``."""
+SCHEMA_VERSION = 2
+"""Bumped whenever the SQLite schema changes; stored in ``application_settings``.
+
+v2 added the provenance columns on ``players`` — the stored stat line a projection
+can be rescored from, and the per-platform ADP/rank columns that a save-and-reload
+used to silently drop.
+"""
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Slot eligibility — the single source of truth for "can player X fill slot Y".
@@ -140,8 +145,11 @@ PLAYER_IMPORT_COLUMNS: tuple[str, ...] = (
     # ``platform_adp``. A user's own file with an "ESPN ADP" header lands here too.
     "ffc_adp", "espn_adp", "espn_rank", "yahoo_adp", "yahoo_rank", "sleeper_rank",
     "adp_source_count", "adp_disagreement", "adp_stdev_is_estimated",
-    # Where the projection came from, and what it is made of.
-    "projection_source", "projection_detail",
+    # Where the projection came from, and what it is made of. ``stat_totals`` is the
+    # machine-readable version of ``projection_detail``: a JSON stat line keyed by the
+    # canonical names in :mod:`core.stats`, which is what allows a projection to be
+    # rescored when scoring rules change instead of refetched.
+    "projection_source", "projection_detail", "stat_totals",
 )
 PLAYER_REQUIRED_COLUMNS: tuple[str, ...] = ("player_name", "position")
 

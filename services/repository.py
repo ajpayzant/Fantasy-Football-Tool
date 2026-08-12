@@ -14,6 +14,7 @@ from typing import Any, Iterable, Sequence
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules, ShrinkageConfig
 from core.enums import Archetype, InjuryStatus, Platform, Position, Slot
 from models.database import (
@@ -611,6 +612,24 @@ def save_player_pool(
             risk_score=player.risk_score,
             value_over_replacement=player.value_over_replacement,
             notes=player.notes,
+            # Provenance. Without ``stat_totals`` a reloaded pool cannot be rescored
+            # when the league's scoring changes, and without the rest a reloaded pool
+            # forgets which of its numbers were measured and which this app guessed.
+            stat_totals=core_stats.to_frame_value(player.stat_totals),
+            projection_imputed=bool(player.projection_imputed),
+            projection_source=player.projection_source,
+            projection_detail=player.projection_detail,
+            tier_source=player.tier_source,
+            outcome_band_source=player.outcome_band_source,
+            adp_stdev_is_estimated=bool(player.adp_stdev_is_estimated),
+            ffc_adp=player.ffc_adp,
+            espn_adp=player.espn_adp,
+            espn_rank=player.espn_rank,
+            yahoo_adp=player.yahoo_adp,
+            yahoo_rank=player.yahoo_rank,
+            sleeper_rank=player.sleeper_rank,
+            adp_source_count=player.adp_source_count,
+            adp_disagreement=player.adp_disagreement,
         )
         player_row.rankings.append(
             PlayerRankingRow(
@@ -671,6 +690,21 @@ def load_player_pool(
                 value_over_replacement=player_row.value_over_replacement,
                 notes=player_row.notes or "",
                 source=row.name,
+                stat_totals=core_stats.from_frame_value(player_row.stat_totals),
+                projection_imputed=bool(player_row.projection_imputed),
+                projection_source=player_row.projection_source or "",
+                projection_detail=player_row.projection_detail or "",
+                tier_source=player_row.tier_source or "",
+                outcome_band_source=player_row.outcome_band_source or "",
+                adp_stdev_is_estimated=bool(player_row.adp_stdev_is_estimated),
+                ffc_adp=player_row.ffc_adp,
+                espn_adp=player_row.espn_adp,
+                espn_rank=player_row.espn_rank,
+                yahoo_adp=player_row.yahoo_adp,
+                yahoo_rank=player_row.yahoo_rank,
+                sleeper_rank=player_row.sleeper_rank,
+                adp_source_count=player_row.adp_source_count,
+                adp_disagreement=player_row.adp_disagreement,
             )
         )
 

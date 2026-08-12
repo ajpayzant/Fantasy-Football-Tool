@@ -35,6 +35,7 @@ from typing import Any
 import pandas as pd
 
 from core.config import ScoringRules
+from core import stats as core_stats
 from core.enums import Position, ScoringPreset
 from core.validation import ValidationReport
 from services.providers import espn_stats
@@ -180,11 +181,11 @@ class ESPNProvider:
                 continue
 
             # Scored under `rules`, not read off ESPN's own total — see espn_stats.
+            parsed_position = Position.coerce(position, None)
             stats = espn_stats.season_projection_stats(player, season)
-            projection = espn_stats.project_points(
-                stats, Position.coerce(position, None), rules
-            )
-            stat_line = espn_stats.projected_stat_line(stats, Position.coerce(position, None))
+            stat_totals = espn_stats.to_stat_line(stats, parsed_position)
+            projection = core_stats.score(stat_totals, parsed_position, rules)
+            stat_line = core_stats.labelled(stat_totals, parsed_position)
 
             rows.append({
                 "espn_id": str(player.get("id")) if player.get("id") is not None else None,
@@ -197,6 +198,10 @@ class ESPNProvider:
                     round(float(projection), 1) if projection is not None else None
                 ),
                 "espn_stat_line": _format_stat_line(stat_line),
+                # The stats themselves, not just the points they came to. This is what
+                # lets a change of scoring rules rescore the board in place instead of
+                # sending the user back to the network for numbers the app already has.
+                "espn_stat_totals": core_stats.to_frame_value(stat_totals),
                 "espn_percent_owned": _as_float(ownership.get("percentOwned")),
                 "injury_status": str(player.get("injuryStatus") or "").upper(),
                 "espn_injured": bool(player.get("injured")),

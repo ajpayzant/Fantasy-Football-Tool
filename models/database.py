@@ -345,6 +345,32 @@ class PlayerRow(Base, TimestampMixin):
     value_over_replacement = Column(Float, nullable=True)
     notes = Column(Text, default="")
 
+    # ── Provenance ───────────────────────────────────────────────────────────
+    # Everything below records where a number came from rather than what it is, and
+    # all of it used to be dropped on save: a pool saved and reloaded came back with
+    # no per-platform ADP columns, no "where did this projection come from" text, and
+    # every derived tier looking as though the user had supplied it. Schema v2.
+    stat_totals = Column(Text, default="")
+    """JSON stat line keyed by :mod:`core.stats` field names. What makes
+    :meth:`models.player.PlayerPool.rescore` possible without a refetch."""
+    projection_imputed = Column(Boolean, default=False)
+    projection_source = Column(Text, default="")
+    projection_detail = Column(Text, default="")
+    tier_source = Column(Text, default="")
+    outcome_band_source = Column(Text, default="")
+    adp_stdev_is_estimated = Column(Boolean, default=False)
+    # Per-platform numbers. Kept on the player rather than in ``player_rankings``
+    # because they are one row per player per platform *column*, not per ranking set,
+    # and the pool reads them side by side to show that the platforms disagree.
+    ffc_adp = Column(Float, nullable=True)
+    espn_adp = Column(Float, nullable=True)
+    espn_rank = Column(Float, nullable=True)
+    yahoo_adp = Column(Float, nullable=True)
+    yahoo_rank = Column(Float, nullable=True)
+    sleeper_rank = Column(Float, nullable=True)
+    adp_source_count = Column(Integer, nullable=True)
+    adp_disagreement = Column(Float, nullable=True)
+
     source = relationship("PlayerDataSourceRow", back_populates="players")
     rankings = relationship(
         "PlayerRankingRow", back_populates="player",
@@ -650,19 +676,43 @@ def _add_column_if_missing(session: Session, table: str, column: str, ddl_type: 
     return True
 
 
+# Added in schema v2: the provenance columns on ``players``. Nullable / defaulted
+# throughout, so an existing row simply comes back with the same blanks it already
+# effectively had — no backfill is possible, because the information was never stored.
+_V2_PLAYER_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("stat_totals", "TEXT"),
+    ("projection_imputed", "BOOLEAN"),
+    ("projection_source", "TEXT"),
+    ("projection_detail", "TEXT"),
+    ("tier_source", "TEXT"),
+    ("outcome_band_source", "TEXT"),
+    ("adp_stdev_is_estimated", "BOOLEAN"),
+    ("ffc_adp", "FLOAT"),
+    ("espn_adp", "FLOAT"),
+    ("espn_rank", "FLOAT"),
+    ("yahoo_adp", "FLOAT"),
+    ("yahoo_rank", "FLOAT"),
+    ("sleeper_rank", "FLOAT"),
+    ("adp_source_count", "INTEGER"),
+    ("adp_disagreement", "FLOAT"),
+)
+
+
 def _migrate(session: Session, from_version: int, to_version: int) -> None:
     """Apply additive migrations between schema versions.
 
     ``create_all`` already creates new *tables*; this handles new *columns* on
     tables that already exist. Steps are written so a partially-applied
     migration can be re-run safely.
-
-    Version 1 is the initial schema, so there is nothing to apply yet. Future
-    steps take the form::
-
-        if from_version < 2:
-            _add_column_if_missing(session, "players", "adot", "FLOAT")
     """
+    if from_version < 2:
+        added = sum(
+            _add_column_if_missing(session, "players", column, ddl_type)
+            for column, ddl_type in _V2_PLAYER_COLUMNS
+        )
+        LOGGER.info("Migration v2: added %s provenance column(s) to players", added)
+    if to_version <= 2:
+        return
     LOGGER.debug("No migration steps defined for v%s → v%s", from_version, to_version)
 
 

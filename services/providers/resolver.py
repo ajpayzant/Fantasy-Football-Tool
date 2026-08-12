@@ -469,9 +469,13 @@ IMPORT_COLUMNS: dict[str, str] = {
     "adp_stdev": "adp_stdev",
     "min_pick": "min_pick",
     "max_pick": "max_pick",
-    # Real projections, and the stat line they were computed from.
+    # Real projections, the stat line they were computed from, and the stats
+    # themselves. ``stat_totals`` is the one that matters structurally: with it the
+    # pool can rescore under new scoring rules offline, and without it a change of
+    # scoring means refetching from ESPN.
     "espn_projection": "projection",
     "espn_stat_line": "projection_detail",
+    "espn_stat_totals": "stat_totals",
     # Each platform's own numbers, kept separate so the Player Pool can show that
     # ESPN and Yahoo disagree rather than only showing the blend.
     "ffc_adp": "ffc_adp",

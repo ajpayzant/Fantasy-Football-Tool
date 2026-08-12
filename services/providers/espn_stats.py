@@ -53,6 +53,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Mapping
 
+from core import stats as core_stats
 from core.config import ScoringRules
 from core.enums import Position
 
@@ -121,7 +122,7 @@ DST_PA_BUCKETS: tuple[tuple[int, str], ...] = (
 GAMES = 210
 
 # Positions scored from the offensive stat block. K and DST use their own.
-SKILL_POSITIONS = frozenset({Position.QB, Position.RB, Position.WR, Position.TE})
+SKILL_POSITIONS = core_stats.SKILL_POSITIONS
 
 
 def season_projection_stats(
@@ -171,174 +172,103 @@ def _get(stats: Mapping[int, float], stat_id: int) -> float:
     return 0.0 if parsed != parsed else parsed
 
 
+# ESPN stat id → the canonical name in :mod:`core.stats`. This table is the entire
+# ESPN-specific part of scoring: everything past it is provider-agnostic, so ESPN's
+# projections and a user's uploaded ones go through exactly one scorer and cannot
+# drift apart. Ids absent from this table are absent on purpose — see the module
+# docstring on why an unidentified stat is worse than a missing one.
+STAT_ID_TO_FIELD: dict[int, str] = {
+    PASS_ATTEMPTS: "pass_attempts",
+    PASS_COMPLETIONS: "pass_completions",
+    PASS_YARDS: "pass_yards",
+    PASS_TD: "pass_td",
+    PASS_TD_40_PLUS: "pass_td_40_plus",
+    PASS_2PT: "pass_2pt",
+    INTERCEPTIONS: "interceptions",
+    RUSH_ATTEMPTS: "rush_attempts",
+    RUSH_YARDS: "rush_yards",
+    RUSH_TD: "rush_td",
+    RUSH_2PT: "rush_2pt",
+    RUSH_TD_40_PLUS: "rush_td_40_plus",
+    TARGETS: "targets",
+    RECEPTIONS: "receptions",
+    REC_YARDS: "rec_yards",
+    REC_TD: "rec_td",
+    REC_2PT: "rec_2pt",
+    REC_TD_40_PLUS: "rec_td_40_plus",
+    FUMBLES_LOST: "fumbles_lost",
+    GAMES: "games",
+    FG_MADE_0_39: "fg_made_0_39",
+    FG_MADE_40_49: "fg_made_40_49",
+    FG_MADE_50_PLUS: "fg_made_50_plus",
+    FG_MADE: "fg_made",
+    FG_ATTEMPTED: "fg_attempted",
+    XP_MADE: "xp_made",
+    DST_SACKS: "dst_sacks",
+    DST_INTERCEPTIONS: "dst_interceptions",
+    DST_FUMBLES_RECOVERED: "dst_fumbles_recovered",
+    DST_SAFETIES: "dst_safeties",
+    DST_TOUCHDOWNS: "dst_touchdowns",
+    DST_POINTS_ALLOWED: "dst_points_allowed",
+    DST_YARDS_ALLOWED: "dst_yards_allowed",
+    **{stat_id: f"dst_pa_games_{rule.removeprefix('dst_points_allowed_')}"
+       for stat_id, rule in DST_PA_BUCKETS},
+}
+
+
+def to_stat_line(
+    stats: Mapping[int, float] | None, position: Position | None = None
+) -> dict[str, float]:
+    """Translate ESPN's ``{stat_id: total}`` into a canonical stat line.
+
+    Only the stats the position is scored on are kept. ESPN's blocks are disjoint by
+    position (offence 0-73, kicking 74-88, defence 89-137), so this filter is not
+    needed to disambiguate ids — it is there so a stored stat line does not carry a
+    defence's yards-allowed on a wide receiver and invite someone to score it.
+    """
+    if not stats:
+        return {}
+    allowed = core_stats.FIELDS_FOR_POSITION.get(position) if position else None
+    line: dict[str, float] = {}
+    for stat_id, field in STAT_ID_TO_FIELD.items():
+        if allowed is not None and field not in allowed:
+            continue
+        value = _get(stats, stat_id)
+        if value:
+            # Not rounded. ESPN projects fractional stats (340.06 completions), and
+            # rounding here moved Josh Allen's season by 0.002 points — harmless in
+            # isolation, but it makes "does the refactor score identically?" an
+            # approximate question, and that check is worth keeping exact.
+            line[field] = value
+    return line
+
+
 def project_points(
     stats: Mapping[int, float] | None,
     position: Position,
     scoring: ScoringRules,
 ) -> float | None:
-    """Score a projected stat line under ``scoring``. ``None`` if unscoreable.
+    """Score an ESPN projected stat line under ``scoring``. ``None`` if unscorable.
 
-    The stat blocks are disjoint by position (offence 0-73, kicking 74-88, defence
-    89-137), so the position only selects which block to read — it never has to
-    disambiguate an id.
+    Kept as a convenience for callers holding raw ESPN ids. The arithmetic lives in
+    :func:`core.stats.score`; this only translates. Callers that will need to
+    *re*-score later — anything that persists a player — should store
+    :func:`to_stat_line` and score from that instead, so a change of scoring rules
+    does not require going back to the network.
     """
-    if not stats:
-        return None
-
-    if position is Position.DST:
-        return _project_dst(stats, scoring)
-    if position is Position.K:
-        return _project_kicker(stats, scoring)
-    if position in SKILL_POSITIONS:
-        return _project_skill(stats, position, scoring)
-    return None
-
-
-def _project_skill(
-    stats: Mapping[int, float], position: Position, scoring: ScoringRules
-) -> float | None:
-    pass_yards = _get(stats, PASS_YARDS)
-    rush_yards = _get(stats, RUSH_YARDS)
-    rec_yards = _get(stats, REC_YARDS)
-    receptions = _get(stats, RECEPTIONS)
-    touchdowns = (
-        _get(stats, PASS_TD) + _get(stats, RUSH_TD) + _get(stats, REC_TD)
-    )
-    # A stat line with no yardage and no scores carries no information — better an
-    # absent projection the pool can flag than a confident 0.0.
-    if not any((pass_yards, rush_yards, rec_yards, receptions, touchdowns)):
-        return None
-
-    total = 0.0
-    if scoring.pass_yards_per_point:
-        total += pass_yards / scoring.pass_yards_per_point
-    total += _get(stats, PASS_TD) * scoring.pass_td
-    total += _get(stats, INTERCEPTIONS) * scoring.interception
-    total += _get(stats, PASS_2PT) * scoring.pass_2pt
-
-    if scoring.rush_yards_per_point:
-        total += rush_yards / scoring.rush_yards_per_point
-    total += _get(stats, RUSH_TD) * scoring.rush_td
-
-    if scoring.rec_yards_per_point:
-        total += rec_yards / scoring.rec_yards_per_point
-    total += _get(stats, REC_TD) * scoring.rec_td
-    total += receptions * scoring.reception_value(position)
-
-    total += (
-        _get(stats, RUSH_2PT) + _get(stats, REC_2PT)
-    ) * scoring.rush_rec_2pt
-    total += _get(stats, FUMBLES_LOST) * scoring.fumble_lost
-
-    if scoring.bonus_long_td_40_plus:
-        long_tds = (
-            _get(stats, PASS_TD_40_PLUS)
-            + _get(stats, RUSH_TD_40_PLUS)
-            + _get(stats, REC_TD_40_PLUS)
-        )
-        total += long_tds * scoring.bonus_long_td_40_plus
-
-    # The per-game yardage bonuses (300-yard passing games and friends) are
-    # deliberately not applied: ESPN publishes season totals, and how many
-    # individual games cleared a threshold cannot be recovered from a season sum.
-    # Their defaults are 0.0, so nothing is silently dropped unless a user turns
-    # one on — which the Settings page says.
-    return float(total)
-
-
-def _project_kicker(
-    stats: Mapping[int, float], scoring: ScoringRules
-) -> float | None:
-    # Prefer the distance buckets, which sum to the published total (74+77+80==83)
-    # and let a league that pays more for long kicks be scored correctly later.
-    made = (
-        _get(stats, FG_MADE_0_39)
-        + _get(stats, FG_MADE_40_49)
-        + _get(stats, FG_MADE_50_PLUS)
-    )
-    if not made:
-        made = _get(stats, FG_MADE)
-    extra_points = _get(stats, XP_MADE)
-    if not made and not extra_points:
-        return None
-    return float(made * scoring.kick_fg_made + extra_points * scoring.kick_xp_made)
-
-
-def _project_dst(
-    stats: Mapping[int, float], scoring: ScoringRules
-) -> float | None:
-    sacks = _get(stats, DST_SACKS)
-    interceptions = _get(stats, DST_INTERCEPTIONS)
-    fumbles = _get(stats, DST_FUMBLES_RECOVERED)
-    touchdowns = _get(stats, DST_TOUCHDOWNS)
-    buckets = {name: _get(stats, key) for key, name in DST_PA_BUCKETS}
-    if not any((sacks, interceptions, fumbles, touchdowns)) and not any(buckets.values()):
-        return None
-
-    total = (
-        sacks * scoring.dst_sack
-        + interceptions * scoring.dst_interception
-        + fumbles * scoring.dst_fumble_recovery
-        + touchdowns * scoring.dst_touchdown
-        + _get(stats, DST_SAFETIES) * scoring.dst_safety
-    )
-    # Points-allowed tiers are the largest single component of real defence
-    # scoring, and each bucket holds the expected *number of games* finishing in
-    # that band, so the contribution is games × the band's value.
-    for name, games in buckets.items():
-        total += games * float(getattr(scoring, name, 0.0))
-    return float(total)
+    return core_stats.score(to_stat_line(stats, position), position, scoring)
 
 
 def projected_stat_line(
-    stats: Mapping[int, float] | None, position: Position
+    stats: Mapping[int, float] | None, position: Position | None
 ) -> dict[str, float]:
-    """Human-readable projected stats, for showing *why* a projection is what it is.
+    """``{display label: value}`` for a raw ESPN stat block.
 
-    Keys are display labels; only the stats relevant to the position are returned,
-    and only where ESPN projected something.
+    Delegates so the labels a user reads are the same ones an uploaded projection
+    gets. Callers with a stored canonical line should use :func:`core.stats.labelled`
+    directly; this exists for the fetch path, which still starts from ESPN ids.
     """
-    if not stats:
-        return {}
-    if position is Position.DST:
-        wanted = [
-            ("Sacks", DST_SACKS),
-            ("Interceptions", DST_INTERCEPTIONS),
-            ("Fumbles recovered", DST_FUMBLES_RECOVERED),
-            ("Touchdowns", DST_TOUCHDOWNS),
-            ("Points allowed", DST_POINTS_ALLOWED),
-            ("Yards allowed", DST_YARDS_ALLOWED),
-        ]
-    elif position is Position.K:
-        wanted = [
-            ("FG made", FG_MADE),
-            ("FG attempted", FG_ATTEMPTED),
-            ("FG made 50+", FG_MADE_50_PLUS),
-            ("XP made", XP_MADE),
-        ]
-    else:
-        wanted = [
-            ("Pass yards", PASS_YARDS),
-            ("Pass TD", PASS_TD),
-            ("Interceptions", INTERCEPTIONS),
-            ("Carries", RUSH_ATTEMPTS),
-            ("Rush yards", RUSH_YARDS),
-            ("Rush TD", RUSH_TD),
-            ("Targets", TARGETS),
-            ("Receptions", RECEPTIONS),
-            ("Rec yards", REC_YARDS),
-            ("Rec TD", REC_TD),
-            ("Fumbles lost", FUMBLES_LOST),
-        ]
-    line: dict[str, float] = {}
-    for label, stat_id in wanted:
-        value = _get(stats, stat_id)
-        if value:
-            line[label] = round(value, 1)
-    games = _get(stats, GAMES)
-    if games:
-        line["Games"] = round(games, 1)
-    return line
+    return core_stats.labelled(to_stat_line(stats, position), position)
 
 
 def verify_stat_map(records: Iterable[Mapping[str, Any]], season: int) -> list[str]:
@@ -405,9 +335,11 @@ def verify_stat_map(records: Iterable[Mapping[str, Any]], season: int) -> list[s
 
 __all__ = [
     "season_projection_stats",
+    "to_stat_line",
     "project_points",
     "projected_stat_line",
     "verify_stat_map",
+    "STAT_ID_TO_FIELD",
     "PROJECTED_SOURCE_ID",
     "SEASON_SPLIT_TYPE_ID",
     "DST_PA_BUCKETS",

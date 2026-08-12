@@ -154,6 +154,10 @@ SCORING_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
 }
 
 
+_K_EDITOR_PRESET = "scoring_editor_seeded_preset"
+"""Which preset the per-event number inputs below were last filled from."""
+
+
 def _scoring_editor(current: ScoringRules, preset: ScoringPreset) -> dict[str, float]:
     """Render every per-event scoring value and return only the ones that changed.
 
@@ -168,6 +172,19 @@ def _scoring_editor(current: ScoringRules, preset: ScoringPreset) -> dict[str, f
     # Pre-fill from the saved league when it is already on this preset, so reopening
     # the form shows what was saved rather than resetting the user's own numbers.
     seed = current if ScoringPreset.coerce(current.preset, None) is preset else baseline
+
+    # Streamlit pins a keyed widget to its session-state value and ignores ``value=``
+    # on every run after the first, so without this the numbers below kept the
+    # *previous* preset's figures after the selectbox above changed. The form then came
+    # back as "custom scoring" holding half-PPR values while the user had just selected
+    # full PPR — they got neither, and nothing on screen said so. Changing the preset
+    # resets these to the new preset's own values, which is what the caption promises.
+    if st.session_state.get(_K_EDITOR_PRESET) != str(preset):
+        for group_fields in SCORING_GROUPS.values():
+            for attr, _label, _help in group_fields:
+                st.session_state.pop(f"scoring_{attr}", None)
+        st.session_state[_K_EDITOR_PRESET] = str(preset)
+
     edited: dict[str, float] = {}
     for group, fields in SCORING_GROUPS.items():
         st.markdown(f"*{group}*")
@@ -484,6 +501,7 @@ with league_tab:
                 ScoringPreset.coerce(current.scoring.preset, ScoringPreset.HALF_PPR)
             ),
             format_func=lambda p: str(p).replace("_", " ").title(),
+            key="league_preset",
         )
         league_format = score_row[1].selectbox(
             "Format", list(LeagueFormat),
@@ -499,12 +517,14 @@ with league_tab:
 
         with st.expander("Advanced scoring — every per-event value"):
             st.caption(
-                "The preset above fills these in. Change any of them and your league "
+                "The preset above fills these in — switching preset refills them, so "
+                "make your edits after choosing one. Change any of them and your league "
                 "is saved as **custom** scoring, keeping the preset's values for "
                 "everything you did not touch. Value over replacement recomputes "
-                "immediately. Projections are ESPN's projected stat lines scored "
-                "under these numbers *at the moment the board was fetched*, so to "
-                "rescore them press **Get current data** again after saving."
+                "immediately. So do the projections: the board stores each player's "
+                "projected stat line, not just the points it came to, so saving a "
+                "change here rescores every projection from those stats offline — no "
+                "refetch, and your ADP does not move underneath you."
             )
             scoring_overrides = _scoring_editor(current.scoring, preset)
 
@@ -546,7 +566,9 @@ with league_tab:
             disabled=["draft_slot"], key="manager_editor",
         )
 
-        submitted = st.form_submit_button("Save league settings", type="primary")
+        submitted = st.form_submit_button(
+            "Save league settings", type="primary", key="save_league"
+        )
 
     if submitted:
         roster = RosterSettings(slots={s: int(v) for s, v in slot_values.items() if v})
@@ -608,10 +630,22 @@ with league_tab:
             league = League(config=config, managers=managers)
             state.set_league(league, source="manual configuration")
             pool = state.pool()
+            scoring_changed = (
+                existing is not None
+                and existing.config.scoring.to_dict() != scoring.to_dict()
+            )
+            rescored = None
             if pool is not None:
                 # Scoring drives projections and value-over-replacement, so a pool
                 # loaded under the previous settings has to be recomputed.
                 pool.apply_league(config)
+                if scoring_changed:
+                    # Rescored here, in place, from each player's stored stat line.
+                    # This used to be a warning telling the user to press "Get current
+                    # data" again — a network round trip to redo arithmetic on numbers
+                    # already saved, which also swapped their whole board's ADP for
+                    # whatever ESPN's had drifted to in the meantime.
+                    rescored = pool.rescore(scoring)
             st.success(
                 f"Saved **{config.name}**. "
                 f"{config.team_count} teams × {config.rounds} rounds = "
@@ -623,24 +657,31 @@ with league_tab:
                     if scoring_overrides else ""
                 )
             )
-            # Real projections were scored when the board was fetched, and the raw
-            # stat lines are not kept in a re-scorable form, so changing scoring
-            # cannot retroactively move them. Say so instead of letting the user
-            # believe the board now reflects the rules they just entered.
-            scoring_changed = (
-                existing is not None
-                and existing.config.scoring.to_dict() != scoring.to_dict()
-            )
-            if scoring_changed and pool is not None and any(
-                p.projection_detail for p in pool
-            ):
-                st.warning(
-                    "You changed scoring, and this board's projections were scored "
-                    "under the previous rules. Everything derived from them — tiers, "
-                    "value over replacement, ceiling and floor — has been recomputed, "
-                    "but the projections feeding it have not moved. Press **Get "
-                    "current data** above to refetch and rescore them."
-                )
+            if rescored is not None:
+                if rescored.changed:
+                    st.info(
+                        "Rescored this board under the new rules — "
+                        f"{rescored.describe()} Tiers, value over replacement, "
+                        "ceiling and floor were re-derived from the new projections."
+                    )
+                else:
+                    # A board with no stored stat lines: an older save, or a user CSV
+                    # that gave points totals only. Nothing to recompute from, and
+                    # saying so beats implying the board now matches the new rules.
+                    st.warning(
+                        "You changed scoring, but this board carries no projected stat "
+                        "lines to rescore from — only the points totals themselves. "
+                        "Everything derived from them has been recomputed, but the "
+                        "projections have not moved. Press **Get current data** above "
+                        "to fetch a board that stores its stat lines."
+                    )
+                if rescored.unscorable_rules:
+                    st.caption(
+                        "Not applied, because a season total cannot say how many "
+                        "individual games cleared a threshold: "
+                        + ", ".join(rescored.unscorable_rules)
+                        + "."
+                    )
             if roster.roster_size != config.rounds:
                 st.warning(
                     f"Roster size ({roster.roster_size}) does not equal the number of "

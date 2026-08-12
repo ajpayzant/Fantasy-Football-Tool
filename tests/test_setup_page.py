@@ -370,6 +370,105 @@ def test_refreshing_the_board_keeps_a_connected_league(recorded_board) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Scoring: the preset you pick is the scoring you get
+# ─────────────────────────────────────────────────────────────────────────────
+def test_switching_preset_refills_the_per_event_values() -> None:
+    """Picking a preset must not leave the previous preset's numbers behind.
+
+    Streamlit pins a keyed widget to its session-state value and ignores ``value=``
+    after the first run, so the per-event inputs in the advanced expander held the old
+    figures. Selecting Full PPR then saving produced a league labelled **custom** that
+    was still scoring half-PPR receptions — the user got neither preset, and nothing
+    on the page said so.
+    """
+    from core.enums import ScoringPreset
+    from ui import state as ui_state
+
+    app = _app().run()
+    app.selectbox(key="league_preset").set_value(ScoringPreset.FULL_PPR).run()
+    app.button(key="save_league").click().run()
+    _assert_clean(app)
+
+    scoring = app.session_state[ui_state.K_LEAGUE].config.scoring
+    assert scoring.preset is ScoringPreset.FULL_PPR
+    assert scoring.reception == 1.0, (
+        f"a full-PPR league is scoring {scoring.reception} per reception"
+    )
+
+    app.selectbox(key="league_preset").set_value(ScoringPreset.STANDARD).run()
+    app.button(key="save_league").click().run()
+    _assert_clean(app)
+
+    scoring = app.session_state[ui_state.K_LEAGUE].config.scoring
+    assert scoring.preset is ScoringPreset.STANDARD
+    assert scoring.reception == 0.0
+
+
+def test_editing_one_value_still_makes_the_league_custom() -> None:
+    """The other half of the same behaviour: a real edit must survive the reset.
+
+    Without this the fix above could pass by resetting the numbers on every run,
+    which would make the advanced editor impossible to use.
+    """
+    from core.enums import ScoringPreset
+    from ui import state as ui_state
+
+    app = _app().run()
+    app.number_input(key="scoring_reception").set_value(0.75).run()
+    app.button(key="save_league").click().run()
+    _assert_clean(app)
+
+    scoring = app.session_state[ui_state.K_LEAGUE].config.scoring
+    assert scoring.preset is ScoringPreset.CUSTOM
+    assert scoring.reception == 0.75
+    # Everything untouched keeps the preset's value rather than a default.
+    assert scoring.pass_td == 4.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Changing scoring rescores the board in place
+# ─────────────────────────────────────────────────────────────────────────────
+@requires_payloads
+def test_changing_scoring_rescores_the_board_without_a_refetch(recorded_board) -> None:
+    """Saving a new scoring preset must move the projections, offline.
+
+    The page used to tell the user to press "Get current data" again — a network round
+    trip to redo arithmetic on stats the app already had, which also swapped the whole
+    board's ADP for whatever ESPN's had drifted to. Asserted through the rendered page
+    because the instruction was the visible half of the bug.
+    """
+    from core.enums import ScoringPreset
+    from ui import state as ui_state
+
+    app = _fetch(_app().run())
+    _assert_clean(app)
+    pool = app.session_state[ui_state.K_POOL]
+    before = {p.player_id: float(p.projection) for p in pool}
+    fetches = len(recorded_board)
+
+    app.selectbox(key="league_preset").set_value(ScoringPreset.FULL_PPR).run()
+    app.button(key="save_league").click().run()
+    _assert_clean(app)
+
+    pool = app.session_state[ui_state.K_POOL]
+    assert pool.league.scoring.preset is ScoringPreset.FULL_PPR
+    moved = [
+        p.name for p in pool
+        if abs(float(p.projection) - before[p.player_id]) > 1.0
+    ]
+    assert len(moved) > 100, (
+        f"only {len(moved)} projections moved when scoring changed to full PPR; "
+        "the board is still scored under the old rules"
+    )
+    assert len(recorded_board) == fetches, "rescoring must not hit the fetch path"
+
+    text = _text(app)
+    assert "Rescored this board" in text
+    assert "refetch and rescore" not in text
+    assert "Get current data" not in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Failure is reported, not hidden
 # ─────────────────────────────────────────────────────────────────────────────
 def test_a_total_fetch_failure_is_explained_on_the_page(
