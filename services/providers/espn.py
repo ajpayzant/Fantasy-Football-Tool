@@ -197,7 +197,6 @@ class ESPNProvider:
                     round(float(projection), 1) if projection is not None else None
                 ),
                 "espn_stat_line": _format_stat_line(stat_line),
-                "espn_auction_value": _as_float(rank_block.get("auctionValue")),
                 "espn_percent_owned": _as_float(ownership.get("percentOwned")),
                 "injury_status": str(player.get("injuryStatus") or "").upper(),
                 "espn_injured": bool(player.get("injured")),

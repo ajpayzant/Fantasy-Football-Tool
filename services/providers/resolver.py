@@ -489,8 +489,8 @@ def board_to_import_frame(board: pd.DataFrame) -> pd.DataFrame:
     """Project a resolved board onto the columns :func:`import_player_pool` reads.
 
     Only the columns named in :data:`IMPORT_COLUMNS` are passed through — anything
-    else on the board (ids, auction values, ownership) is provider bookkeeping the
-    player pool has no field for.
+    else on the board (per-provider ids, ownership percentages) is provider
+    bookkeeping the player pool has no field for.
     """
     frame = pd.DataFrame(index=board.index)
     for source_column, canonical in IMPORT_COLUMNS.items():

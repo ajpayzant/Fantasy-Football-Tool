@@ -27,7 +27,9 @@ class Keeper:
     removes_pick: bool = True
     """When True the assigned pick is consumed and skipped in the draft order."""
     salary: float | None = None
-    """Auction / cap value — stored for Phase 4, unused by the snake engine."""
+    """Contract value in a salary-cap keeper league. Carried through import, save and
+    load so a user's own keeper sheet round-trips intact, but nothing computes with
+    it — the draft engine costs a keeper in picks, not dollars."""
     position: Position | None = None
     nfl_team: str | None = None
     notes: str = ""

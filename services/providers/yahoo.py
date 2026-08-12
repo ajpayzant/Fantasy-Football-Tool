@@ -1,10 +1,14 @@
-"""Yahoo: average draft position and cost from Yahoo's public read API.
+"""Yahoo: average draft position from Yahoo's public read API.
 
 Yahoo runs a read-only public mirror of its fantasy API at
 ``pub-api-ro.fantasysports.yahoo.com`` which answers without OAuth for public
 league data. The ``draft_analysis`` subresource on the player collection is what
-this provider reads: it returns average pick, average round, average auction cost
-and percent drafted, aggregated across Yahoo's leagues.
+this provider reads: it returns average pick, average round and percent drafted,
+aggregated across Yahoo's leagues.
+
+Yahoo also returns an average auction cost per player. It is deliberately not
+read: this app does not simulate auctions, so carrying the column would mean
+storing and displaying a number nothing can act on.
 
 Two structural things about this API:
 
@@ -64,12 +68,12 @@ NO_DATA = "-"
 
 
 class YahooProvider:
-    """Fetches Yahoo ADP and auction cost via the public read API."""
+    """Fetches Yahoo ADP via the public read API."""
 
     key = "yahoo"
     label = "Yahoo"
     description = (
-        "Yahoo's average draft pick, round and auction cost, aggregated across "
+        "Yahoo's average draft pick, round and percent drafted, aggregated across "
         "Yahoo leagues. Public read API, no login required."
     )
     requires_credentials = False
@@ -247,7 +251,6 @@ def _parse_page(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "nfl_team": team if team in NFL_TEAMS else "",
                 "yahoo_adp": _as_float(fields.get("average_pick")),
                 "yahoo_avg_round": _as_float(fields.get("average_round")),
-                "yahoo_auction_cost": _as_float(fields.get("average_cost")),
                 "yahoo_percent_drafted": _as_float(fields.get("percent_drafted")),
                 "yahoo_preseason_adp": _as_float(fields.get("preseason_average_pick")),
             })

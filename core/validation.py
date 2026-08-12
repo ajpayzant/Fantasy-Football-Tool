@@ -290,13 +290,6 @@ def validate_league(config: LeagueConfig) -> ValidationReport:
                 f"{config.rounds}.",
             )
 
-    if config.draft_type is DraftType.AUCTION:
-        report.warn(
-            "auction_not_simulated",
-            "Auction drafts are not simulated yet — the data model supports them "
-            "but the engine will treat this league as a snake draft.",
-        )
-
     return report
 
 

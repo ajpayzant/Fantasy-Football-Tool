@@ -65,13 +65,23 @@ class Slot(StrEnum):
 
 
 class DraftType(StrEnum):
-    """Supported pick-ordering schemes."""
+    """Supported pick-ordering schemes.
+
+    Every member here is fully simulated. There was an ``AUCTION`` member that was
+    selectable and accepted but modelled nothing — it fell through to plain
+    ascending order and emitted a warning — and it has been removed rather than
+    left as a trap for someone who picks it and believes their bidding is being
+    modelled.
+
+    A league saved earlier with ``draft_type="auction"`` still loads: ``coerce``
+    does not recognise the string and :class:`core.config.LeagueConfig` falls back
+    to :attr:`SNAKE`, which is what the engine did with it anyway.
+    """
 
     SNAKE = "snake"
     LINEAR = "linear"
     THIRD_ROUND_REVERSAL = "third_round_reversal"
     CUSTOM = "custom"
-    AUCTION = "auction"  # Phase 4 placeholder; not simulated yet.
 
 
 class LeagueFormat(StrEnum):

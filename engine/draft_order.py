@@ -28,8 +28,6 @@ def round_slot_order(config: LeagueConfig, round_number: int) -> list[int]:
       previous round's direction, flipping the pattern from there on.
     * ``custom`` — the explicit order given for that round, falling back to
       snake for rounds the user did not specify.
-    * ``auction`` — nominal ascending order (auctions are not simulated in
-      Phase 1; :func:`core.validation.validate_league` warns about this).
     """
     team_count = int(config.team_count)
     if team_count < 1:
@@ -41,7 +39,7 @@ def round_slot_order(config: LeagueConfig, round_number: int) -> list[int]:
     descending = list(reversed(ascending))
 
     draft_type = config.draft_type
-    if draft_type is DraftType.LINEAR or draft_type is DraftType.AUCTION:
+    if draft_type is DraftType.LINEAR:
         return ascending
 
     if draft_type is DraftType.CUSTOM:
