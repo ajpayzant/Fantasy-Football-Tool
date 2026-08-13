@@ -29,15 +29,53 @@ from engine.simulator import (
 )
 from models.database import session_scope
 from models.draft import MockDraftResult
+from services import draft_session
 from services.repository import save_mock_draft
 from ui import components, state
 
 LOGGER = logging.getLogger("fantasy_mock_draft.ui.draft_room")
 
+_K_RESUME_IDS = "resume_draft_ids"
+"""Session key holding ``(league_id, source_id)`` for the autosave.
+
+Kept in session rather than looked up per render: they are written once when the
+draft starts, and re-deriving them would mean a database query on every rerun.
+"""
+
 components.page_header(
     "🎯 Draft Room",
     "A live mock draft against the modelled opponents.",
 )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recovering from a refresh
+#
+# This runs before ``require()`` on purpose. Session state is gone after a
+# refresh, so the gate would otherwise send the user to Setup to fetch data again
+# — and by the time they had, the saved draft would be stranded in the database
+# with nothing able to reach it. Reloading the league and board the snapshot names
+# is what turns "recoverable" into "the refresh did not happen".
+# ─────────────────────────────────────────────────────────────────────────────
+_snapshot = draft_session.load_snapshot()
+if (
+    _snapshot is not None
+    and not _snapshot.is_empty
+    and state.draft() is None
+    and (state.league() is None or state.pool() is None)
+):
+    _revived = draft_session.rehydrate(_snapshot)
+    if _revived.ok:
+        state.set_league(_revived.league, source="restored with the saved draft")
+        state.set_pool(_revived.pool, source="restored with the saved draft")
+        LOGGER.info("Reloaded the league and board for a saved draft")
+    elif _revived.reason:
+        st.warning(
+            f"There is a saved draft ({_snapshot.label()}) but it cannot be "
+            f"reopened: {_revived.reason}. Load a league and board on **Setup** "
+            "first.",
+            icon="🗂️",
+        )
+
 components.require()
 
 league = state.league()
@@ -58,6 +96,56 @@ if not profiles:
 # ─────────────────────────────────────────────────────────────────────────────
 draft = state.draft()
 
+if draft is None and draft_session.resumable(_snapshot, league, pool):
+    # Offered rather than restored automatically. Replaying picks changes what the
+    # page shows completely, and a user who deliberately abandoned a draft and came
+    # back to start a fresh one should not find the old one waiting for them.
+    with st.container(border=True):
+        st.subheader("🗂️ Pick up where you left off")
+        st.write(
+            f"**{_snapshot.label()}** — {draft_session.describe_age(_snapshot)}."
+        )
+        st.caption(
+            "Saved automatically after every pick. Restoring replays those picks "
+            "through the same code that made them, so the rosters, the clock and "
+            "undo all come back — it is the draft, not a summary of it."
+        )
+        resume_columns = st.columns([1, 1, 2])
+        if resume_columns[0].button(
+            "Resume draft", type="primary", key="resume_draft", width="stretch"
+        ):
+            outcome = draft_session.restore(_snapshot, league, pool, settings)
+            state.set_draft(outcome.draft)
+            # ``set_draft`` runs after the restore, and the league/pool writes above
+            # already cleared the snapshot in the rehydrate case, so it is written
+            # back rather than assumed to still be there.
+            draft_session.save_snapshot(
+                draft_session.with_sources(
+                    draft_session.snapshot_from_draft(outcome.draft),
+                    league_id=_snapshot.league_id, source_id=_snapshot.source_id,
+                )
+            )
+            for message in outcome.warnings:
+                components.flash(message, "warning")
+            if outcome.is_exact:
+                components.flash(
+                    f"Restored {outcome.replayed} pick(s). You are back on the clock "
+                    "where you left off.",
+                )
+            st.rerun()
+        if resume_columns[1].button(
+            "Discard it", key="discard_draft", width="stretch"
+        ):
+            draft_session.clear_snapshot()
+            components.flash("Saved draft discarded.", "info")
+            st.rerun()
+        with st.expander(f"The {_snapshot.pick_count} saved pick(s)"):
+            st.dataframe(
+                pd.DataFrame(draft_session.snapshot_frame_rows(_snapshot)),
+                width="stretch", hide_index=True, height=260,
+            )
+    st.divider()
+
 if draft is None:
     st.subheader("Start a draft")
     start_columns = st.columns([1, 1, 1, 2])
@@ -74,6 +162,12 @@ if draft is None:
         league.set_user_slot(int(user_slot))
         new_draft = DraftState(league, pool, settings=settings, seed=int(seed))
         state.set_draft(new_draft)
+        # Saved here, once, so a resume has a league and a board to come back to.
+        # Doing it per pick would re-save several hundred player rows every click.
+        league_id, source_id = draft_session.persist_inputs(
+            league, pool, is_sample=state.is_sample_data()
+        )
+        st.session_state[_K_RESUME_IDS] = (league_id, source_id)
         LOGGER.info(
             "Draft started: slot %d, seed %d, %d picks",
             user_slot, seed, league.config.team_count * league.config.rounds,
@@ -85,6 +179,38 @@ if draft is None:
         f"{league.config.draft_type} order."
     )
     st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autosave
+#
+# Once per render, not at each of the six places a pick can be made. Every one of
+# those ends in ``st.rerun()``, so the render that follows sees the mutation and
+# saves it: one write per interaction, and a pick path added later cannot forget.
+# ─────────────────────────────────────────────────────────────────────────────
+_autosave_enabled = not state.is_sample_data()
+"""Sample data is never written to the database.
+
+Resuming needs the board stored, and storing a fictional board would put it in the
+"reload a saved league" list on Setup as though it were real — the one thing the
+sample-data rules exist to prevent. A synthetic draft is still fully playable; it
+just does not survive a refresh.
+"""
+
+if _autosave_enabled:
+    _league_id, _source_id = st.session_state.get(_K_RESUME_IDS) or (
+        league.config.league_id,
+        _snapshot.source_id if _snapshot is not None else None,
+    )
+    if _source_id is None:
+        # A draft resumed in a fresh session, or one started before this feature
+        # existed, has no stored board id yet. Store one now so the *next* refresh
+        # can reload it — otherwise the autosave keeps writing picks that point at
+        # nothing.
+        _league_id, _source_id = draft_session.persist_inputs(
+            league, pool, is_sample=False
+        )
+        st.session_state[_K_RESUME_IDS] = (_league_id, _source_id)
+    draft_session.autosave(draft, league_id=_league_id, source_id=_source_id)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Status bar
@@ -157,8 +283,23 @@ if control_columns[3].button(
 
 if control_columns[4].button("Abandon this draft", width="stretch"):
     state.set_draft(None)
+    draft_session.clear_snapshot()
+    st.session_state.pop(_K_RESUME_IDS, None)
     components.flash("Draft abandoned.", "info")
     st.rerun()
+
+if _autosave_enabled:
+    st.caption(
+        "💾 Saved automatically after every pick — a refresh, a closed tab or a "
+        "sleeping laptop will not lose this draft. *Abandon* is the only thing that "
+        "deletes it."
+    )
+else:
+    st.caption(
+        "⚠️ This draft is **not** being saved, because the loaded board is flagged as "
+        "sample data and nothing fictional is written to your database. A refresh "
+        "will lose it."
+    )
 
 st.divider()
 

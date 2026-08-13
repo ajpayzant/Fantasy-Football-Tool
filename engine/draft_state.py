@@ -140,6 +140,31 @@ class DraftState:
         self._seed = seed
         self._rng = random.Random(seed)
 
+    def rng_state(self) -> tuple:
+        """The generator's exact position in its stream.
+
+        Needed to save and resume a draft. The seed alone is not enough: the stream
+        advances with every simulated pick, so a draft rebuilt from the seed would
+        start drawing from the beginning again and the opponents would behave
+        differently from the pick after the resume onward — with nothing on screen to
+        explain why.
+        """
+        return self._rng.getstate()
+
+    def set_rng_state(self, state: Any) -> bool:
+        """Put the generator back where it was. ``False`` if the state is unusable.
+
+        A state saved by a different Python build can be rejected by ``setstate``.
+        That is worth a warning and a slightly different room, not a lost draft, so
+        the failure is reported rather than raised.
+        """
+        try:
+            self._rng.setstate(state)
+        except (TypeError, ValueError) as error:
+            LOGGER.warning("Could not restore the draft's RNG position: %s", error)
+            return False
+        return True
+
     # -- keepers ---------------------------------------------------------
     def _apply_keepers(self) -> None:
         """Reserve keeper players and resolve any keeper picks at the front.

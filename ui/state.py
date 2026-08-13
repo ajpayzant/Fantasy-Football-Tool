@@ -171,6 +171,26 @@ def _clear_draft(reason: str) -> None:
     if st.session_state.get(K_DRAFT) is not None:
         LOGGER.info("Discarding the in-progress draft: %s", reason)
         st.session_state[K_DRAFT] = None
+        # The saved copy goes with it. A snapshot that outlived the draft it came
+        # from would offer to restore picks made against a board or a league that no
+        # longer exists — the resume offer checks for that, but leaving the record
+        # behind means the check has to keep being right forever.
+        discard_saved_draft(reason)
+
+
+def discard_saved_draft(reason: str = "") -> None:
+    """Forget the autosaved draft. Imported lazily so the UI can load headless.
+
+    ``services.draft_session`` reaches the database, and this module is imported by
+    every page at startup; a database that cannot be opened should not stop the app
+    from rendering the page that explains why.
+    """
+    try:
+        from services import draft_session
+
+        draft_session.clear_snapshot()
+    except Exception:  # pragma: no cover - never worth failing a render over
+        LOGGER.exception("Could not clear the saved draft (%s)", reason or "no reason")
 
 
 def _clear_derived() -> None:
@@ -242,6 +262,6 @@ __all__ = [
     "Provenance", "ensure_initialised", "league", "pool", "history", "profiles",
     "draft", "settings", "provenance", "is_sample_data", "set_league", "set_pool",
     "set_history", "set_profiles", "set_draft", "set_settings", "mark_sample_data",
-    "cached", "readiness", "blocking_reason",
+    "cached", "readiness", "blocking_reason", "discard_saved_draft",
     "K_LAST_RECS", "K_LAST_AVAIL", "K_MC_REPORT",
 ]
