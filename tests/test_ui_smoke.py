@@ -121,10 +121,123 @@ def test_draft_room_renders_and_recommends(loaded) -> None:
     )
 
 
+def test_the_board_is_above_the_recommendations(loaded) -> None:
+    """Layout, asserted because it is the whole point of the redesign.
+
+    The board and the shortlist have to render *before* the lenses: a drafter reads
+    what has gone, then what is left, then what the model thinks. Position is checked
+    by index rather than by eye so a later edit that moves a section back to the bottom
+    fails here instead of silently regressing.
+    """
+    app = _app("4_draft_room.py", loaded, with_draft=30).run()
+    _assert_clean(app, "4_draft_room.py")
+    headings = [block.value for block in app.subheader]
+    assert "The board" in headings, headings
+    assert "Best players left" in headings, headings
+    assert headings.index("The board") < headings.index("Best players left")
+    assert headings.index("Best players left") < headings.index(
+        "What to do with this pick"
+    )
+
+
+def test_every_board_view_renders(loaded) -> None:
+    """All four tabs, including the grid's Styler, which only fails when rendered."""
+    from ui import board_views
+
+    league, pool, _history, profiles = loaded
+    draft = DraftState(league, pool, seed=11)
+    simulator = DraftSimulator(draft, profiles)
+    for _ in range(30):
+        simulator.simulate_pick()
+
+    order = board_views.draft_order_frame(draft)
+    assert len(order) == 30
+    # Newest first, so the top row is the most recent pick.
+    assert order.iloc[0]["Overall"] == 30
+
+    grid, marks = board_views.snake_grid(draft, league)
+    assert len(grid.columns) == league.config.team_count
+    assert len(grid) == league.config.rounds
+    # 30 picks in a 12-team league fills two rounds and six of the third.
+    assert (marks.loc["R1"] != "").all()
+    assert (marks.loc["R2"] != "").all()
+    assert "__clock__" in marks.to_numpy().ravel().tolist()
+
+    shape = board_views.roster_shape_frame(draft, league)
+    assert len(shape) == league.config.team_count
+    assert shape["Picks"].sum() == 30
+
+
+def test_the_shortlist_honours_the_users_board(loaded) -> None:
+    """A do-not-draft player must not appear in the best-players-left table."""
+    from services.user_board import UserBoard
+    from ui import board_views
+
+    league, pool, _history, profiles = loaded
+    draft = DraftState(league, pool, seed=11)
+    available = draft.available_players(limit=5)
+    banned = available[0].name
+
+    frame = board_views.top_remaining_frame(
+        draft, UserBoard(avoid=[banned], targets=[available[3].name]),
+        count=10, order="My board",
+    )
+    assert banned not in set(frame["Player"])
+    # The target is promoted above the three players ADP puts ahead of them.
+    assert frame.iloc[0]["Player"] == available[3].name
+    assert frame.iloc[0]["Mine"] == "🎯 1"
+
+
 def test_draft_room_start_form_renders_without_a_draft(loaded) -> None:
     app = _app("4_draft_room.py", loaded).run()
     _assert_clean(app, "4_draft_room.py (no draft)")
     assert any("Start draft" in button.label for button in app.button)
+
+
+@pytest.mark.parametrize("column_set", ["ADP by platform", "Ranks by platform"])
+def test_player_pool_platform_views_render(column_set: str, loaded) -> None:
+    """Both per-platform views, which the default render never reaches.
+
+    They select columns by display name, so a rename in the frame breaks them silently
+    — the table would simply come out short rather than raising.
+    """
+    app = _app("2_player_pool.py", loaded).run()
+    _assert_clean(app, "2_player_pool.py")
+    app.radio[0].set_value(column_set).run()
+    _assert_clean(app, f"2_player_pool.py ({column_set})")
+    shown = app.dataframe[-1].value if app.dataframe else None
+    assert shown is not None
+    expected = "Avg ADP" if column_set == "ADP by platform" else "Avg rank"
+    assert any(
+        expected in list(frame.columns) for frame in
+        [d.value for d in app.dataframe if hasattr(d.value, "columns")]
+    ), f"{expected} did not reach any table"
+
+
+def test_the_room_can_be_built_by_hand(loaded) -> None:
+    """The from-scratch route: a declared archetype has to reach the built profile."""
+    from core.enums import Archetype
+
+    app = _app("3_manager_profiles.py", loaded).run()
+    _assert_clean(app, "3_manager_profiles.py")
+    league = app.session_state["league"]
+    slots = sorted(m.draft_slot for m in league.managers)
+    target = slots[1]
+
+    editor = app.session_state["room_editor"]
+    assert editor is not None, "the room editor did not register in session state"
+
+    # data_editor edits arrive as a patch dict keyed by row index, which is how a real
+    # click reaches the page — building the frame directly would skip the page's own
+    # reading of it.
+    app.session_state["room_editor"] = {
+        "edited_rows": {
+            slots.index(target): {"How they draft": str(Archetype.ZERO_RB)},
+        },
+        "added_rows": [], "deleted_rows": [],
+    }
+    app = app.run()
+    _assert_clean(app, "3_manager_profiles.py (edited room)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

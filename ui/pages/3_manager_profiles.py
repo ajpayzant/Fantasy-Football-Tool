@@ -25,7 +25,7 @@ from core.enums import Archetype, Position, ProvenanceKind
 from engine.features import annotate_history
 from engine.opponent_model import build_profiles, observe_manager
 from models.league import League
-from models.manager import ManagerPreferences
+from models.manager import Manager, ManagerPreferences
 from services.normalize import player_key
 from ui import components, state
 
@@ -67,11 +67,195 @@ PROVENANCE_LABELS = {
 # ─────────────────────────────────────────────────────────────────────────────
 if not history.drafts:
     st.warning(
-        "No draft history is loaded, so every opponent will be modelled on the "
-        "league-average prior — the app still runs, but the opponents will not be "
-        "*your* opponents. Import past drafts on **Setup** to change that.",
+        "No draft history is loaded, so nothing has been *observed* about anybody. "
+        "There are two ways to get a room worth drafting against, and they combine: "
+        "**describe the managers yourself** below, or **import past drafts** on "
+        "**Setup** (paste a draft recap or upload a CSV) and let the model infer them. "
+        "With neither, all twelve opponents are the same league-average drafter.",
         icon="⚠️",
     )
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build the room by hand
+#
+# The estimator can only describe what is in a history file, and plenty of leagues have
+# no history file — a new league, a public draft, a first year on this app. Without this
+# section those users get twelve identical opponents, which is worse than useless
+# because it looks like a modelled room and behaves like one drafter copied twelve
+# times. A declared archetype per seat is thin evidence, but it is *evidence*, and it
+# goes through exactly the same preference path as everything else on this page: stored
+# on ``Manager.preferences``, read by ``build_profiles``, and overwritten by real picks
+# the moment any are imported.
+# ─────────────────────────────────────────────────────────────────────────────
+_NO_ARCHETYPE = "(let the model infer it)"
+_NO_TEAM = "(none)"
+_EXPERIENCE_LEVELS = ["new", "average", "veteran", "expert"]
+
+with st.expander(
+    "👥 Build the room by hand — name every manager and say how they draft",
+    expanded=not history.drafts,
+):
+    st.caption(
+        "One row per seat. Names are what historical picks are joined on, so spelling "
+        "them the way your league spells them is what lets an import later attach to "
+        "the right person. Everything else here is optional: leave *how they draft* "
+        "alone and that manager stays whatever the model infers."
+    )
+    st.caption(
+        "This is the from-scratch route. If you have real drafts, the other route is "
+        "better — **Setup → Import past drafts** reads a pasted recap or a CSV and the "
+        "model builds each profile from the picks themselves, which you can then adjust "
+        "here exactly like anything you typed."
+    )
+
+    _slots = list(range(1, int(league.config.team_count) + 1))
+    _seated = {int(m.draft_slot): m for m in league.managers}
+    room_frame = st.data_editor(
+        pd.DataFrame({
+            "Slot": _slots,
+            "Manager": [
+                (_seated[s].name if s in _seated else f"Slot {s}") for s in _slots
+            ],
+            "You": [
+                bool(_seated[s].is_user) if s in _seated else False for s in _slots
+            ],
+            "How they draft": [
+                (
+                    str(_seated[s].preferences.typical_strategy)
+                    if s in _seated and _seated[s].preferences.typical_strategy
+                    else _NO_ARCHETYPE
+                )
+                for s in _slots
+            ],
+            "Experience": [
+                (
+                    _seated[s].preferences.experience_level
+                    if s in _seated
+                    and _seated[s].preferences.experience_level in _EXPERIENCE_LEVELS
+                    else "average"
+                )
+                for s in _slots
+            ],
+            "Fan of": [
+                (
+                    (_seated[s].preferences.favorite_nfl_team or _NO_TEAM).upper()
+                    if s in _seated else _NO_TEAM
+                )
+                for s in _slots
+            ],
+        }),
+        width="stretch", hide_index=True, disabled=["Slot"], key="room_editor",
+        column_config={
+            "You": st.column_config.CheckboxColumn(
+                "You", help="Which seat you are drafting from. Exactly one.",
+            ),
+            "How they draft": st.column_config.SelectboxColumn(
+                "How they draft",
+                options=[_NO_ARCHETYPE] + [str(a) for a in Archetype],
+                help="A declared archetype. It sets their positional leans and timing "
+                     "directly, which is the only thing that makes a history-less room "
+                     "contain twelve different drafters instead of twelve copies.",
+            ),
+            "Experience": st.column_config.SelectboxColumn(
+                "Experience", options=_EXPERIENCE_LEVELS,
+                help="Used only where nothing was observed about how predictable they "
+                     "are: an expert drafts closer to the list, a new manager wanders.",
+            ),
+            "Fan of": st.column_config.SelectboxColumn(
+                "Fan of", options=[_NO_TEAM] + list(NFL_TEAMS),
+                help="Homer bias — raises their chance of taking that team's players.",
+            ),
+        },
+    )
+
+    with st.expander("What each archetype does when you pick it"):
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Archetype": str(archetype).replace("_", " ").title(),
+                    "How they behave": components.archetype_caption(archetype),
+                }
+                for archetype in Archetype
+            ]),
+            width="stretch", hide_index=True,
+        )
+
+    if st.button("Save the room and rebuild", type="primary", key="save_room"):
+        rows = room_frame.to_dict("records")
+        user_rows = [row for row in rows if bool(row["You"])]
+        if len(user_rows) != 1:
+            # Refused rather than guessed. Which seat is yours decides every survival
+            # number on the Draft Room page, and silently picking one would make all of
+            # them quietly wrong.
+            st.error(
+                "Tick exactly one seat as **You** — "
+                + (
+                    "no seat is ticked." if not user_rows
+                    else f"{len(user_rows)} are ticked."
+                )
+                + " Which seat you draft from decides every 'will he last' number in "
+                "the Draft Room."
+            )
+        else:
+            new_managers = []
+            for row in rows:
+                slot = int(row["Slot"])
+                existing = _seated.get(slot)
+                # ``replace`` rather than a fresh object: this editor covers three of
+                # the fourteen preference fields, and rebuilding from scratch would
+                # silently discard the named players and positional notes entered in
+                # the detail section below.
+                base = existing.preferences if existing else ManagerPreferences()
+                strategy = row["How they draft"]
+                new_managers.append(Manager(
+                    name=str(row["Manager"]).strip() or f"Slot {slot}",
+                    draft_slot=slot,
+                    is_user=bool(row["You"]),
+                    manager_id=existing.manager_id if existing else None,
+                    preferences=replace(
+                        base,
+                        typical_strategy=(
+                            None if strategy == _NO_ARCHETYPE else strategy
+                        ),
+                        experience_level=str(row["Experience"]),
+                        favorite_nfl_team=(
+                            None if row["Fan of"] == _NO_TEAM else str(row["Fan of"])
+                        ),
+                    ),
+                ))
+            rebuilt = League(config=league.config, managers=new_managers)
+            rebuilt.set_user_slot(int(user_rows[0]["Slot"]))
+            report = rebuilt.validate()
+            for issue in report.warnings:
+                st.caption(f"Room: {issue.message}")
+            if not report.ok:
+                for issue in report.errors:
+                    st.error(issue.message)
+            else:
+                state.set_league(rebuilt, source="managers entered by hand")
+                if history.drafts:
+                    annotate_history(history, pool=pool, roster=league.config.roster)
+                state.set_profiles(
+                    build_profiles(
+                        rebuilt, history if history.drafts else None,
+                        settings=state.settings(), pool=pool, annotate=False,
+                    )
+                )
+                LOGGER.info("Room rebuilt by hand: %d managers", len(new_managers))
+                named = sum(
+                    1 for row in rows if row["How they draft"] != _NO_ARCHETYPE
+                )
+                components.flash(
+                    f"Saved {len(new_managers)} managers and rebuilt their profiles"
+                    + (
+                        f" — {named} of them with a strategy you declared."
+                        if named else
+                        ". Nobody has a declared strategy yet, so they are still "
+                        "twelve versions of the same drafter — set *how they draft* "
+                        "above, or import real drafts on **Setup**."
+                    )
+                )
+                st.rerun()
 
 build_columns = st.columns([1, 1, 2])
 if build_columns[0].button("Build profiles", type="primary", width="stretch"):
@@ -290,7 +474,20 @@ with detail_right:
         )
     if profile.repeat_players:
         st.markdown("**Players they draft again and again**")
-        st.caption(", ".join(sorted(profile.repeat_players)))
+        st.caption(
+            ", ".join(
+                f"{name} ({seasons} seasons)"
+                for name, seasons in sorted(
+                    profile.repeat_players.items(), key=lambda kv: (-kv[1], kv[0])
+                )
+            )
+        )
+        st.caption(
+            "Counted in separate seasons, not picks, so this is a habit rather than one "
+            "memorable draft. The simulator now pulls this manager toward these players "
+            "when they are on the board — the strength is the *repeat player affinity* "
+            "weight on **Settings**."
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tell the model what you know about them
