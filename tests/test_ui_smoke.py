@@ -326,6 +326,14 @@ def _pool_tables(app: AppTest) -> list:
     return [d.value for d in app.dataframe if hasattr(d.value, "columns")]
 
 
+def _main_pool_table(app: AppTest):
+    """The player table itself, not the provenance or coverage tables beside it."""
+    return next(
+        frame for frame in _pool_tables(app)
+        if "Player" in frame.columns and "ADP" in frame.columns
+    )
+
+
 def test_every_platforms_own_adp_is_on_the_default_table(multi_platform) -> None:
     """The per-platform columns must be on the view the user lands on.
 
@@ -335,9 +343,28 @@ def test_every_platforms_own_adp_is_on_the_default_table(multi_platform) -> None
     app = _pool_app(multi_platform).run()
     _assert_clean(app, "2_player_pool.py (multi-platform)")
 
-    headers = {column for frame in _pool_tables(app) for column in frame.columns}
-    for expected in ("FFC ADP", "ESPN ADP", "Yahoo ADP", "Avg ADP", "ADP"):
-        assert expected in headers, f"{expected} is not on the default table"
+    columns = list(_main_pool_table(app).columns)
+    for expected in ("ADP", "FFC ADP", "ESPN ADP", "Yahoo ADP"):
+        assert expected in columns, f"{expected} is not on the default table"
+
+
+def test_the_default_table_does_not_duplicate_the_blend_with_a_plain_average(
+    multi_platform,
+) -> None:
+    """`Avg ADP` stays off the Value view, because on most rows it is a copy of `ADP`.
+
+    A player only one source lists has the same number either way — a weighted blend of
+    one opinion *is* that opinion — and short platform boards make that most of the
+    pool. The comparison is real, so it lives in the view whose job is comparing.
+    """
+    app = _pool_app(multi_platform).run()
+    assert "Avg ADP" not in list(_main_pool_table(app).columns)
+
+    app.radio[0].set_value("ADP by platform").run()
+    _assert_clean(app, "2_player_pool.py (ADP by platform)")
+    columns = list(_main_pool_table(app).columns)
+    assert "Avg ADP" in columns, "the comparison view lost the plain average"
+    assert "Avg − blend" in columns
 
 
 def test_deselecting_a_platform_drops_its_column_and_leaves_the_average_alone(
@@ -350,16 +377,18 @@ def test_deselecting_a_platform_drops_its_column_and_leaves_the_average_alone(
     app.multiselect(key="pool_platforms").set_value(["FFC", "ESPN"]).run()
     _assert_clean(app, "2_player_pool.py (FFC + ESPN only)")
 
-    headers = {column for frame in _pool_tables(app) for column in frame.columns}
-    assert "Yahoo ADP" not in headers, "a deselected platform kept its column"
-    assert "FFC ADP" in headers
-    assert "ESPN ADP" in headers
+    columns = list(_main_pool_table(app).columns)
+    assert "Yahoo ADP" not in columns, "a deselected platform kept its column"
+    assert "FFC ADP" in columns
+    assert "ESPN ADP" in columns
 
-    # FFC is index+1 and ESPN is index+3, so their mean is index+2 — computed from the
-    # two selected sources only, with Yahoo's index no longer pulling it down.
-    table = next(f for f in _pool_tables(app) if "Avg ADP" in f.columns)
-    row = table.iloc[0]
-    assert abs(float(row["Avg ADP"]) - (float(row["FFC ADP"]) + float(row["ESPN ADP"])) / 2) < 0.05
+    # The average is only shown in the comparison view, so check it there: with Yahoo
+    # deselected it must be the mean of the two remaining sources, not of all three.
+    app.radio[0].set_value("ADP by platform").run()
+    _assert_clean(app, "2_player_pool.py (ADP by platform, FFC + ESPN)")
+    row = _main_pool_table(app).iloc[0]
+    expected = (float(row["FFC ADP"]) + float(row["ESPN ADP"])) / 2
+    assert abs(float(row["Avg ADP"]) - expected) < 0.05
 
 
 def test_the_fully_covered_filter_drops_players_a_platform_never_listed(

@@ -521,6 +521,7 @@ sort_options = {
     "Risk (safest first)": ("risk_score", True),
     "Risk (riskiest first)": ("risk_score", False),
     "Source disagreement": ("adp_disagreement", False),
+    "Sources (most first)": ("adp_source_count", False),
     "Average ADP across sources": ("avg_source_adp", True),
     "Average rank across sources": ("avg_source_rank", True),
     "Consensus rank": ("overall_rank", True),
@@ -641,9 +642,17 @@ selected_rank_labels = [PLATFORM_COLUMN_LABELS[c] for c in selected_rank_columns
 # live only in the two "by platform" views, which meant the answer to "what does each
 # site say about this player" was behind a radio button in the corner of the filter row —
 # findable, but only if you already knew it was there.
+#
+# `Avg ADP` is deliberately *not* here, though it is two columns away in the ADP view.
+# For any player only one source lists, a weighted blend and a plain mean are both that
+# source's number, so the two columns are identical — and in this pool that is three
+# quarters of the rows, because FFC and Yahoo publish roughly 215 players deep while
+# ESPN goes 1000. A column that duplicates its neighbour on most rows reads as
+# redundant, which is a fair reading. The comparison is real but it is a comparison, so
+# it belongs in the view whose job is comparing.
 VALUE_COLUMNS = [
     "Player", "Pos", "Team", "Bye", "Tier",
-    "ADP", *selected_adp_labels, "Avg ADP", "Sources",
+    "ADP", *selected_adp_labels, "Sources",
     "Proj", "VOR", "Ceiling", "Floor", "Risk", "Rookie", "Injury",
 ]
 ADP_PLATFORM_COLUMNS = [
@@ -665,12 +674,13 @@ if not board.is_empty:
 
 if column_set == "Value" and selected_adp_labels:
     st.caption(
-        "`ADP` is the weighted blend the engine drafts against; "
+        "`ADP` is the blend the engine drafts against — a *weighted* one, so it is not "
+        "the average of the columns beside it; "
         + ", ".join(f"`{label}`" for label in selected_adp_labels)
-        + " are each platform's own number, unmodified; and `Avg ADP` is the plain "
-        "unweighted mean of them. A blank cell means that platform never listed the "
-        "player, not that it rates him badly. Switch to **ADP by platform** for the "
-        "spread between sources, or **Ranks by platform** for what the sites say."
+        + " are each platform's own number, unmodified. A blank cell means that "
+        "platform never listed the player, not that it rates him badly. Switch to "
+        "**ADP by platform** to see the blend against a plain average and the spread "
+        "between sources."
     )
 elif column_set == "ADP by platform":
     st.caption(
@@ -680,6 +690,13 @@ elif column_set == "ADP by platform":
         "mean of the columns to its right, and `Avg − blend` is the difference: "
         "positive means the blend has him going *earlier* than a straight average "
         "would, because it trusts the source that likes him more."
+    )
+    st.caption(
+        "`Avg − blend` is **0.0 for any player only one source lists** — with one "
+        "opinion a weighted blend and a plain mean are the same number. It is only "
+        "meaningful where `Sources` is 2 or 3, which in practice means the top couple "
+        "of hundred players, because FFC and Yahoo publish much shorter boards than "
+        "ESPN. Sort by `Sources` to see those rows together."
     )
 elif column_set == "Ranks by platform":
     st.caption(
@@ -725,6 +742,14 @@ st.dataframe(
             "Sources", format="%d",
             help="How many ADP sources had this player. A blended ADP from one source "
                  "is a single opinion, not a consensus.",
+        ),
+        "ADP": st.column_config.NumberColumn(
+            "ADP", format="%.1f",
+            help="The blended average draft position the engine drafts against. A "
+                 "*weighted* blend — Fantasy Football Calculator counts double, being "
+                 "the only source built from real drafts — so it is deliberately not "
+                 "the plain average of the columns beside it. The weights are editable "
+                 "on **Settings**.",
         ),
         "FFC ADP": st.column_config.NumberColumn(
             "FFC ADP", format="%.1f",
