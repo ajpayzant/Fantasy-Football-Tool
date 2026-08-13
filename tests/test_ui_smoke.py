@@ -21,6 +21,7 @@ thing worth asserting there is that no route to this fixture exists.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,16 @@ from engine.features import annotate_history
 from engine.opponent_model import build_profiles
 from engine.simulator import DraftSimulator
 
-PAGES = Path(__file__).resolve().parents[1] / "ui" / "pages"
+ROOT = Path(__file__).resolve().parents[1]
+PAGES = ROOT / "ui" / "pages"
+
+# Every page this module actually runs, in one place so the coverage test below can
+# check it against what ``app.py`` registers. A page in the app but not in here is a
+# page whose imports nobody checks until a user clicks the tab.
+COVERED_PAGES = {
+    "1_setup.py", "2_player_pool.py", "3_manager_profiles.py", "4_draft_room.py",
+    "5_simulations.py", "6_analysis.py", "7_settings.py",
+}
 
 # Generous: a page that builds profiles or runs rollouts does real work, and a
 # timeout here would be a flaky failure rather than a finding.
@@ -89,6 +99,38 @@ def _assert_clean(app: AppTest, page: str) -> None:
     """No unhandled exception rendered anywhere on the page."""
     assert not app.exception, (
         f"{page} raised: " + " | ".join(str(e.value) for e in app.exception)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Coverage: no page in the app may go unrun here
+# ─────────────────────────────────────────────────────────────────────────────
+def test_every_registered_page_is_covered_by_these_tests() -> None:
+    """The pages ``app.py`` registers must all be run by this module.
+
+    A page that nobody runs here is a page whose import list is unverified, and a bad
+    import in Streamlit is invisible until someone clicks the tab — the exact failure
+    these tests exist to catch. ``app.py`` is read rather than imported because it calls
+    ``main()`` at module scope, and every page file on disk is checked too, so an
+    orphaned page cannot hide either.
+    """
+    source = (ROOT / "app.py").read_text(encoding="utf-8")
+    registered = set(re.findall(r'"ui/pages/([^"]+\.py)"', source))
+    assert registered, "no pages found in app.py — has _PAGE_FILES been renamed?"
+
+    on_disk = {
+        path.name for path in PAGES.glob("*.py") if not path.name.startswith("_")
+    }
+    assert registered <= COVERED_PAGES, (
+        "registered in app.py but never run by these tests: "
+        + ", ".join(sorted(registered - COVERED_PAGES))
+    )
+    assert on_disk <= COVERED_PAGES, (
+        "page files that no test runs: " + ", ".join(sorted(on_disk - COVERED_PAGES))
+    )
+    assert COVERED_PAGES <= on_disk, (
+        "listed as covered but no such file: "
+        + ", ".join(sorted(COVERED_PAGES - on_disk))
     )
 
 
