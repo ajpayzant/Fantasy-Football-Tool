@@ -1,7 +1,12 @@
 """Draft Room: run a mock draft, pick by pick, with the engine's reasoning exposed.
 
-The layout follows the actual decision a drafter makes on the clock:
+The layout follows the order a drafter actually reads, which is why the board comes
+first and the advice last:
 
+* **The board** — what has gone, in three views: the pick list, the wall-chart grid
+  where the snake is visible as a shape, and every team's roster construction.
+* **Best players left** — the shortlist, so a pick can be made without consulting the
+  model at all.
 * **Who picks between now and my next turn**, and what they are likely to take.
 * **Who will still be there when I pick again** — survival odds, simulated against
   those specific managers rather than against ADP.
@@ -31,7 +36,7 @@ from models.database import session_scope
 from models.draft import MockDraftResult
 from services import draft_session
 from services.repository import save_mock_draft
-from ui import components, state
+from ui import board_views, components, state
 
 LOGGER = logging.getLogger("fantasy_mock_draft.ui.draft_room")
 
@@ -300,6 +305,142 @@ else:
         "sample data and nothing fictional is written to your database. A refresh "
         "will lose it."
     )
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The board
+#
+# First on the page, above the advice. A drafter on the clock looks at the board and
+# then at the suggestions, in that order, and the suggestions only mean anything
+# against what is already gone. Three views because they answer different questions:
+# the list is a log, the grid is where-are-we, the rosters are what-is-everyone-building.
+# ─────────────────────────────────────────────────────────────────────────────
+st.subheader("The board")
+order_tab, grid_tab, rosters_tab, runs_tab = st.tabs(
+    ["📋 Draft order", "🗓️ Board grid", "👥 Team rosters", "📈 Runs and scarcity"]
+)
+
+with order_tab:
+    board_views.render_draft_order(draft)
+
+with grid_tab:
+    board_views.render_snake_grid(draft, league, user_slot=user_slot)
+
+with rosters_tab:
+    board_views.render_team_rosters(draft, league, pool, user_slot=user_slot)
+
+with runs_tab:
+    st.caption(
+        "A run is several managers taking the same position in quick succession. The "
+        "engine's opponents chase runs at their own estimated rate, so a run in "
+        "progress genuinely raises the chance the next pick is that position too."
+    )
+    snapshot = draft.run_snapshot()
+    for window, counts in snapshot.counts_by_window.items():
+        if counts:
+            components.position_bar_chart(
+                {p: n for p, n in counts.items()},
+                f"Positions taken in the last {window} picks",
+            )
+    gaps = {
+        str(position): ("never" if gap is None else gap)
+        for position, gap in snapshot.picks_since_position.items()
+    }
+    st.markdown("**Picks since each position last went**")
+    st.dataframe(
+        pd.DataFrame(sorted(gaps.items()), columns=["Position", "Picks ago"]),
+        width="stretch", hide_index=True,
+    )
+    st.markdown("**Drafted so far, by position**")
+    components.position_bar_chart(
+        dict(draft.position_counts_drafted()), "Total drafted"
+    )
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The shortlist
+#
+# Above the recommendations on purpose. The lenses answer "what should I take"; this
+# answers "what is even there", which is the question a drafter asks first and the one
+# that lets them disagree with the model from an informed position rather than a blind
+# one. A pick can be made straight from here without consulting any lens.
+# ─────────────────────────────────────────────────────────────────────────────
+if not draft.is_complete:
+    _board = state.user_board()
+    st.subheader("Best players left")
+    shortlist_columns = st.columns([1, 1, 1, 2])
+    top_count = shortlist_columns[0].number_input(
+        "How many", min_value=5, max_value=100, value=25, step=5,
+        key="top_remaining_count",
+    )
+    top_position = shortlist_columns[1].selectbox(
+        "Position", ["All"] + [str(p) for p in Position], key="top_remaining_position",
+    )
+    top_order = shortlist_columns[2].selectbox(
+        "Order by",
+        ["Board order", "My board", "Projection", "Value over replacement"],
+        key="top_remaining_order",
+        help="`Board order` is the blended consensus ranking. `My board` applies your "
+             "target list and your own rankings from **Player Pool** — the gap between "
+             "the two is where you are deliberately off consensus.",
+    )
+    top_frame = board_views.top_remaining_frame(
+        draft, _board,
+        count=int(top_count),
+        position=None if top_position == "All" else Position.coerce(top_position),
+        order=top_order,
+    )
+    if top_frame.empty:
+        st.caption("Nobody left at that position.")
+    else:
+        st.dataframe(
+            top_frame.drop(columns=["player_id"]),
+            width="stretch", hide_index=True,
+            height=min(640, 60 + 35 * len(top_frame)),
+            column_config={
+                "Mine": st.column_config.TextColumn(
+                    "Mine",
+                    help="🎯 N = your target list, in your order. ⛔ = never draft.",
+                ),
+                "VOR": st.column_config.NumberColumn(
+                    "VOR",
+                    help="Value over replacement: projected points above the last "
+                         "startable player at this position in your league. It is what "
+                         "makes 250 points at tight end worth more than 250 at running "
+                         "back.",
+                ),
+            },
+        )
+        pick_columns = st.columns([3, 1])
+        shortlist_ids = list(top_frame["player_id"])
+        shortlist_names = dict(zip(top_frame["player_id"], top_frame["Player"]))
+        quick_id = pick_columns[0].selectbox(
+            "Draft from this list", shortlist_ids,
+            format_func=lambda pid: shortlist_names.get(pid, pid),
+            key="top_remaining_pick",
+        )
+        if pick_columns[1].button(
+            "Draft", key="top_remaining_draft", width="stretch",
+            disabled=not draft.is_user_on_clock,
+        ):
+            try:
+                made = draft.make_pick(
+                    quick_id, explanation="Taken from the best-players-left list."
+                )
+            except ConfigurationError as error:
+                st.error(f"That pick was rejected: {error}")
+            else:
+                LOGGER.info(
+                    "Shortlist pick %s: %s", made.overall_pick, made.player_name
+                )
+                st.rerun()
+        if not draft.is_user_on_clock:
+            st.caption(
+                "It is not your turn, so this button is disabled — use *Draft anyone* "
+                "below to pick for the manager on the clock."
+            )
 
 st.divider()
 
@@ -585,145 +726,18 @@ if not draft.is_complete:
             st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Board and rosters
+# Keeping it
+#
+# The autosave above survives a refresh but is overwritten by the next draft. This is
+# the deliberate keep: a named record that stays put and can be opened on Analysis.
 # ─────────────────────────────────────────────────────────────────────────────
-st.subheader("The board")
-board_tab, roster_tab, runs_tab, save_tab = st.tabs(
-    ["Picks so far", "Rosters", "Runs and scarcity", "Save"]
-)
-
-with board_tab:
-    picks = draft.picks
-    if not picks:
-        st.caption("No picks yet.")
-    else:
-        board_frame = pd.DataFrame([
-            {
-                "Pick": f"{pick.round_number}.{pick.pick_in_round:02d}",
-                "Overall": pick.overall_pick,
-                "Manager": pick.manager_name,
-                "You": "★" if pick.is_user_pick else "",
-                "Player": pick.player_name,
-                "Pos": str(pick.position) if pick.position else "",
-                "Team": pick.nfl_team or "",
-                "ADP": pick.adp_at_pick,
-                "Reach": (
-                    round(pick.overall_pick - pick.adp_at_pick, 1)
-                    if pick.adp_at_pick else None
-                ),
-                "Slot filled": str(pick.assigned_slot or ""),
-                "Why": pick.explanation,
-            }
-            for pick in reversed(picks)
-        ])
-        st.dataframe(board_frame, width="stretch", hide_index=True, height=420)
-        components.download_frame(board_frame, "Download board (CSV)", "draft_board.csv")
-        st.caption(
-            "`Reach` is picks earlier than ADP — negative means the player fell. "
-            "Newest pick first."
-        )
-
-with roster_tab:
-    slot_choice = st.selectbox(
-        "Team", league.slots_in_order(),
-        index=max(0, league.slots_in_order().index(user_slot)),
-        format_func=lambda s: (
-            f"Slot {s} — {league.require_manager_by_slot(s).name}"
-            + (" (you)" if s == user_slot else "")
-        ),
-    )
-    roster = draft.roster_copy(slot_choice)
-    roster_left, roster_right = st.columns([2, 1])
-    with roster_left:
-        st.markdown("**Starting lineup**")
-        lineup_rows = []
-        for slot, player_ids in roster.lineup.items():
-            for player_id in player_ids:
-                player = pool.get(player_id)
-                lineup_rows.append({
-                    "Slot": str(slot),
-                    "Player": player.name if player else player_id,
-                    "Pos": str(player.position) if player else "",
-                    "Proj": player.projection if player else None,
-                    "Bye": player.bye_week if player else None,
-                })
-        if lineup_rows:
-            st.dataframe(
-                pd.DataFrame(lineup_rows), width="stretch", hide_index=True
-            )
-        else:
-            st.caption("No starters yet.")
-
-        if roster.bench:
-            st.markdown("**Bench**")
-            st.dataframe(
-                pd.DataFrame([
-                    {
-                        "Player": (pool.get(pid).name if pool.get(pid) else pid),
-                        "Pos": str(pool.get(pid).position) if pool.get(pid) else "",
-                        "Proj": pool.get(pid).projection if pool.get(pid) else None,
-                    }
-                    for pid in roster.bench
-                ]),
-                width="stretch", hide_index=True,
-            )
-
-    with roster_right:
-        st.markdown("**Still to fill**")
-        open_slots = roster.open_starting_slots()
-        if open_slots:
-            st.dataframe(
-                pd.DataFrame(
-                    [{"Slot": str(s), "Open": n} for s, n in open_slots.items()]
-                ),
-                width="stretch", hide_index=True,
-            )
-        else:
-            st.success("Every starting slot is filled.")
-        st.metric("Roster size", f"{len(roster)} / {league.config.roster.roster_size}")
-        components.position_bar_chart(
-            {p: n for p, n in roster.position_counts().items()}, "Positions rostered"
-        )
-
-        notes = draft.strategy_notes(slot_choice)
-        note = st.text_input("Add a note about this team", key=f"note_{slot_choice}")
-        if st.button("Save note", key=f"save_note_{slot_choice}") and note.strip():
-            draft.note_strategy(slot_choice, note.strip())
-            st.rerun()
-        for existing in notes:
-            st.caption(f"• {existing}")
-
-with runs_tab:
+st.divider()
+with st.expander("💾 Save this draft for later", expanded=draft.is_complete):
     st.caption(
-        "A run is several managers taking the same position in quick succession. The "
-        "engine's opponents chase runs at their own estimated rate, so a run in "
-        "progress genuinely raises the chance the next pick is that position too."
-    )
-    snapshot = draft.run_snapshot()
-    for window, counts in snapshot.counts_by_window.items():
-        if counts:
-            components.position_bar_chart(
-                {p: n for p, n in counts.items()},
-                f"Positions taken in the last {window} picks",
-            )
-    gaps = {
-        str(position): ("never" if gap is None else gap)
-        for position, gap in snapshot.picks_since_position.items()
-    }
-    st.markdown("**Picks since each position last went**")
-    st.dataframe(
-        pd.DataFrame(sorted(gaps.items()), columns=["Position", "Picks ago"]),
-        width="stretch", hide_index=True,
-    )
-    st.markdown("**Drafted so far, by position**")
-    components.position_bar_chart(
-        dict(draft.position_counts_drafted()), "Total drafted"
-    )
-
-with save_tab:
-    st.caption(
-        "Saves the picks and every team's final roster to the local database, so the "
-        "draft can be reviewed on **Analysis** after this session ends."
+        "Saves the picks and every team's final roster to the local database under a "
+        "name, so the draft can be reviewed on **Analysis** after this session ends. "
+        "This is separate from the automatic save, which only ever holds the *current* "
+        "draft."
     )
     save_name = st.text_input(
         "Name", value=f"{league.config.name} mock (pick {draft.pick_index})"
