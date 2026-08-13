@@ -7,7 +7,7 @@ this module renders it, and the page puts it first.
 
 Three views, because they answer different questions:
 
-* **Draft order** — "what has happened", newest first. A log.
+* **Draft order** — "what has happened", in draft order from 1.01 down. A log.
 * **The board** — "where are we", the wall-chart grid every real draft room has, one
   column per team and one row per round, snaking left-to-right then right-to-left so
   the shape of the order is visible rather than described.
@@ -32,29 +32,45 @@ from models.player import PlayerPool
 from services.user_board import UserBoard
 
 POSITION_COLOURS: dict[str, str] = {
-    "QB": "#f2d0d9",
-    "RB": "#cfe8d4",
-    "WR": "#cfe0f2",
-    "TE": "#f6e3c5",
-    "K": "#e4dcf0",
-    "DST": "#dcdcdc",
+    "QB": "#f7b7c2",
+    "RB": "#a8dfba",
+    "WR": "#a9cbef",
+    "TE": "#f6cf94",
+    "K": "#cbbce8",
+    "DST": "#c9ced6",
 }
 """Background per position on the grid.
 
-Deliberately pale: the grid is read as text, and saturated colours make a wall of
-twelve columns unreadable. They are also the only cue that survives shrinking a cell
-to fit, which is why position is coloured rather than, say, reach.
+Pale, because the grid is read as text and saturated colours make a wall of twelve
+columns unreadable — but not so pale that the position stops being distinguishable at
+a glance. They are also the only cue that survives shrinking a cell to fit, which is
+why position is coloured rather than, say, reach.
 """
 
-_ON_CLOCK_COLOUR = "#fff3bf"
-_EMPTY_COLOUR = "#fafafa"
+_ON_CLOCK_COLOUR = "#ffe066"
+_EMPTY_COLOUR = "#eef1f5"
+
+_CELL_TEXT_COLOUR = "#111827"
+_EMPTY_TEXT_COLOUR = "#5b6675"
+"""Text colour is set explicitly on every grid cell, and that is not optional.
+
+The app ships no theme of its own, so Streamlit follows the browser's — and in dark
+mode it renders table text white. A style that sets only ``background-color`` then
+puts white text on a pale background, which is invisible. Pinning both halves of the
+pair makes the grid readable under either theme instead of only the light one.
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # View 1 — the draft order as a list
 # ─────────────────────────────────────────────────────────────────────────────
-def draft_order_frame(draft: DraftState, *, newest_first: bool = True) -> pd.DataFrame:
-    """Every pick made, in order, with what it cost against ADP."""
+def draft_order_frame(draft: DraftState, *, newest_first: bool = False) -> pd.DataFrame:
+    """Every pick made, in order, with what it cost against ADP.
+
+    Defaults to draft order — 1.01 first, at the top. Newest-first was the wrong
+    default: a pick list is read the way the draft happened, and reversing it means
+    scrolling to the bottom to find the first round and then reading upwards.
+    """
     picks = list(reversed(draft.picks)) if newest_first else list(draft.picks)
     return pd.DataFrame([
         {
@@ -82,11 +98,16 @@ def render_draft_order(draft: DraftState) -> None:
     if not draft.picks:
         st.caption("No picks yet. Advance the clock or make one.")
         return
-    frame = draft_order_frame(draft)
+    newest_first = st.toggle(
+        "Newest pick first", value=False, key="draft_order_newest_first",
+        help="Off is draft order: 1.01 at the top, reading down the way the draft "
+             "happened. On puts the most recent pick at the top.",
+    )
+    frame = draft_order_frame(draft, newest_first=newest_first)
     st.dataframe(frame, width="stretch", hide_index=True, height=420)
     st.caption(
         "`Reach` is picks earlier than ADP — negative means the player fell to them. "
-        "Newest pick first."
+        + ("Newest pick first." if newest_first else "Draft order, 1.01 first.")
     )
     from ui import components
 
@@ -143,29 +164,39 @@ def snake_grid(draft: DraftState, league: League) -> tuple[pd.DataFrame, pd.Data
     return grid.fillna(""), mark.fillna("")
 
 
+def grid_styles(marks: pd.DataFrame) -> pd.DataFrame:
+    """CSS per grid cell, from the parallel frame of position codes.
+
+    A module-level function rather than a closure so the one rule that matters here can
+    be asserted in a test: **every** cell sets a text colour as well as a background.
+    """
+    styles = marks.copy()
+    for row in marks.index:
+        for column in marks.columns:
+            token = marks.at[row, column]
+            if token == "__clock__":
+                styles.at[row, column] = (
+                    f"background-color: {_ON_CLOCK_COLOUR}; "
+                    f"color: {_CELL_TEXT_COLOUR}; font-weight: 700"
+                )
+            elif token:
+                styles.at[row, column] = (
+                    f"background-color: {POSITION_COLOURS.get(token, _EMPTY_COLOUR)}; "
+                    f"color: {_CELL_TEXT_COLOUR}; font-weight: 600"
+                )
+            else:
+                styles.at[row, column] = (
+                    f"background-color: {_EMPTY_COLOUR}; color: {_EMPTY_TEXT_COLOUR}"
+                )
+    return styles
+
+
 def render_snake_grid(draft: DraftState, league: League, *, user_slot: int) -> None:
     """The wall chart, coloured by position with the current pick highlighted."""
     grid, marks = snake_grid(draft, league)
     if grid.empty:
         st.caption("The draft order is empty.")
         return
-
-    def colour(_: pd.DataFrame) -> pd.DataFrame:
-        styles = marks.copy()
-        for row in marks.index:
-            for column in marks.columns:
-                token = marks.at[row, column]
-                if token == "__clock__":
-                    styles.at[row, column] = (
-                        f"background-color: {_ON_CLOCK_COLOUR}; font-weight: 700"
-                    )
-                elif token:
-                    styles.at[row, column] = (
-                        f"background-color: {POSITION_COLOURS.get(token, _EMPTY_COLOUR)}"
-                    )
-                else:
-                    styles.at[row, column] = f"background-color: {_EMPTY_COLOUR}"
-        return styles
 
     st.caption(
         "One column per team, one row per round — so the snake reads as a shape: "
@@ -179,16 +210,20 @@ def render_snake_grid(draft: DraftState, league: League, *, user_slot: int) -> N
     if user_column:
         st.caption(f"You are **{user_column[0]}**.")
     st.dataframe(
-        grid.style.apply(colour, axis=None),
+        grid.style.apply(lambda _: grid_styles(marks), axis=None),
         width="stretch", height=min(720, 60 + 46 * len(grid)),
     )
-    legend = " · ".join(
-        f"{position}" for position in POSITION_COLOURS if position in set(
-            marks.to_numpy().ravel()
-        )
-    )
-    if legend:
-        st.caption(f"Positions on the board: {legend}")
+    # A colour key rather than a list of names: the grid's only compact cue is the
+    # background, so the legend has to show the actual swatch to be worth anything.
+    on_board = set(marks.to_numpy().ravel())
+    chips = [
+        f'<span style="background-color:{colour};color:{_CELL_TEXT_COLOUR};'
+        f'padding:2px 10px;border-radius:4px;font-weight:600;font-size:0.8rem;'
+        f'margin-right:6px;display:inline-block">{position}</span>'
+        for position, colour in POSITION_COLOURS.items() if position in on_board
+    ]
+    if chips:
+        st.markdown("".join(chips), unsafe_allow_html=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -376,6 +411,6 @@ def top_remaining_frame(
 
 __all__ = [
     "POSITION_COLOURS", "draft_order_frame", "render_draft_order", "snake_grid",
-    "render_snake_grid", "roster_shape_frame", "render_team_rosters",
+    "grid_styles", "render_snake_grid", "roster_shape_frame", "render_team_rosters",
     "top_remaining_frame",
 ]

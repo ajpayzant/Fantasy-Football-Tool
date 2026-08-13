@@ -194,8 +194,14 @@ def test_every_board_view_renders(loaded) -> None:
 
     order = board_views.draft_order_frame(draft)
     assert len(order) == 30
-    # Newest first, so the top row is the most recent pick.
-    assert order.iloc[0]["Overall"] == 30
+    # Draft order by default: 1.01 at the top, read downwards. Asserted rather than
+    # eyeballed because the earlier default was the reverse and it is an easy regression.
+    assert order.iloc[0]["Overall"] == 1
+    assert order.iloc[0]["Pick"] == "1.01"
+    assert order.iloc[-1]["Overall"] == 30
+    assert list(order["Overall"]) == sorted(order["Overall"])
+    newest = board_views.draft_order_frame(draft, newest_first=True)
+    assert newest.iloc[0]["Overall"] == 30
 
     grid, marks = board_views.snake_grid(draft, league)
     assert len(grid.columns) == league.config.team_count
@@ -208,6 +214,31 @@ def test_every_board_view_renders(loaded) -> None:
     shape = board_views.roster_shape_frame(draft, league)
     assert len(shape) == league.config.team_count
     assert shape["Picks"].sum() == 30
+
+
+def test_every_grid_cell_sets_a_text_colour(loaded) -> None:
+    """Background without foreground is invisible under a dark browser theme.
+
+    The app ships no theme, so Streamlit follows the browser's and renders table text
+    white in dark mode. A cell style that sets only ``background-color`` then puts white
+    text on a pale background. Both halves, on every cell, or the grid is unreadable for
+    half the users.
+    """
+    from ui import board_views
+
+    league, pool, _history, profiles = loaded
+    draft = DraftState(league, pool, seed=11)
+    simulator = DraftSimulator(draft, profiles)
+    for _ in range(30):
+        simulator.simulate_pick()
+
+    _grid, marks = board_views.snake_grid(draft, league)
+    styles = board_views.grid_styles(marks)
+    cells = styles.to_numpy().ravel().tolist()
+    assert cells, "no cells to style"
+    for style in cells:
+        assert "background-color:" in style, style
+        assert "color:" in style.replace("background-color:", ""), style
 
 
 def test_the_shortlist_honours_the_users_board(loaded) -> None:
@@ -256,6 +287,97 @@ def test_player_pool_platform_views_render(column_set: str, loaded) -> None:
     ), f"{expected} did not reach any table"
 
 
+@pytest.fixture
+def multi_platform(loaded):
+    """The bundle with per-platform ADP and ranks on it.
+
+    The synthetic pool carries none — every number came from one source — so a page that
+    only ever renders it can drop the per-platform columns without any test noticing.
+    The values are written straight onto the pool's players, which is where
+    ``to_frame`` reads them from, so the page is exercised through its real path. A deep
+    copy because the ``loaded`` fixture is module-scoped and shared.
+    """
+    import copy
+
+    league, pool, history, profiles = loaded
+    pool = copy.deepcopy(pool)
+    for index, player in enumerate(pool):
+        adp = float(index + 1)
+        player.ffc_adp = adp
+        player.espn_adp = adp + 2.0
+        # Yahoo lists a short board, like the real one: every third player only. This is
+        # what makes the average worth taking over "sources that have him" rather than
+        # over all of them, and what the fully-covered filter has to notice.
+        player.yahoo_adp = adp - 1.0 if index % 3 == 0 else None
+        player.espn_rank = index + 1
+        player.sleeper_rank = index + 5
+    return league, pool, history, profiles
+
+
+def _pool_app(multi_platform) -> AppTest:
+    app = _app("2_player_pool.py", multi_platform)
+    from ui import state as ui_state
+
+    app.session_state[ui_state.K_POOL] = multi_platform[1]
+    return app
+
+
+def _pool_tables(app: AppTest) -> list:
+    return [d.value for d in app.dataframe if hasattr(d.value, "columns")]
+
+
+def test_every_platforms_own_adp_is_on_the_default_table(multi_platform) -> None:
+    """The per-platform columns must be on the view the user lands on.
+
+    They used to exist only under a "Columns" radio in the corner of the filter row,
+    which is why the answer to "what does each site say" looked missing.
+    """
+    app = _pool_app(multi_platform).run()
+    _assert_clean(app, "2_player_pool.py (multi-platform)")
+
+    headers = {column for frame in _pool_tables(app) for column in frame.columns}
+    for expected in ("FFC ADP", "ESPN ADP", "Yahoo ADP", "Avg ADP", "ADP"):
+        assert expected in headers, f"{expected} is not on the default table"
+
+
+def test_deselecting_a_platform_drops_its_column_and_leaves_the_average_alone(
+    multi_platform,
+) -> None:
+    """The picker drives the columns *and* the average, which is the point of it."""
+    app = _pool_app(multi_platform).run()
+    assert "Yahoo" in app.multiselect(key="pool_platforms").value
+
+    app.multiselect(key="pool_platforms").set_value(["FFC", "ESPN"]).run()
+    _assert_clean(app, "2_player_pool.py (FFC + ESPN only)")
+
+    headers = {column for frame in _pool_tables(app) for column in frame.columns}
+    assert "Yahoo ADP" not in headers, "a deselected platform kept its column"
+    assert "FFC ADP" in headers
+    assert "ESPN ADP" in headers
+
+    # FFC is index+1 and ESPN is index+3, so their mean is index+2 — computed from the
+    # two selected sources only, with Yahoo's index no longer pulling it down.
+    table = next(f for f in _pool_tables(app) if "Avg ADP" in f.columns)
+    row = table.iloc[0]
+    assert abs(float(row["Avg ADP"]) - (float(row["FFC ADP"]) + float(row["ESPN ADP"])) / 2) < 0.05
+
+
+def test_the_fully_covered_filter_drops_players_a_platform_never_listed(
+    multi_platform,
+) -> None:
+    """Yahoo has only every third player, so requiring all three has to cut the rest."""
+    app = _pool_app(multi_platform).run()
+    before = next(f for f in _pool_tables(app) if "Yahoo ADP" in f.columns)
+    assert before["Yahoo ADP"].isna().any(), "the fixture should have gaps to filter on"
+
+    app.checkbox(key="pool_complete_only").set_value(True).run()
+    _assert_clean(app, "2_player_pool.py (fully covered)")
+
+    after = next(f for f in _pool_tables(app) if "Yahoo ADP" in f.columns)
+    assert not after["Yahoo ADP"].isna().any(), "a player with no Yahoo ADP survived"
+    assert len(after) < len(before)
+
+
 def test_the_room_can_be_built_by_hand(loaded) -> None:
     """The from-scratch route: a declared archetype has to reach the built profile."""
     from core.enums import Archetype
@@ -292,12 +414,24 @@ def test_the_room_can_be_built_by_hand(loaded) -> None:
     "5_simulations.py",
     "6_analysis.py",
 ])
-def test_page_blocks_cleanly_with_nothing_loaded(page: str) -> None:
+def test_page_blocks_cleanly_with_nothing_loaded(
+    page: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The empty state is the first thing a new user sees on every page they open out
-    of order, so it has to be a sentence rather than a traceback."""
+    of order, so it has to be a sentence rather than a traceback.
+
+    ``load_snapshot`` is stubbed out because it reads the real autosave from the real
+    database. With a draft saved there — which is the normal state of a machine the app
+    has been used on — the Draft Room correctly rehydrates its league and board, the
+    gate never fires, and this test fails for a reason that has nothing to do with the
+    empty state. "Nothing loaded" has to mean nothing on disk either.
+    """
     from core.config import SimulationConfig
     from models.draft import DraftHistory
+    from services import draft_session
     from ui import state as ui_state
+
+    monkeypatch.setattr(draft_session, "load_snapshot", lambda: None)
 
     app = AppTest.from_file(str(PAGES / page), default_timeout=TIMEOUT)
     app.session_state[ui_state.K_INITIALISED] = True

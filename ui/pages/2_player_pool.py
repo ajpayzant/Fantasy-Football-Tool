@@ -8,6 +8,8 @@ recommendation that surprises you usually traces back to one of those.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import pandas as pd
 import streamlit as st
 
@@ -25,17 +27,66 @@ league = state.league()
 frame = pool.to_frame()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Straight averages across the sources
+# The platforms this pool carries
 #
-# The `overall_adp` the engine uses is a *weighted* blend — sources are not trusted
-# equally, and the weights are editable on Settings. That is the right number to draft
-# against and the wrong number to answer "what do the platforms think on average",
-# because a user comparing columns cannot see the weights. So the plain unweighted mean
-# is computed here and shown beside the per-platform columns: if it disagrees with the
-# blend, the difference is the weighting, which is the one thing worth noticing.
+# Every source keeps its own column all the way to the table, and those columns are on
+# the default view rather than hidden behind a toggle. The engine drafts against a
+# single *weighted* blend (`overall_adp`, weights editable on Settings), which is the
+# right number to draft against and the wrong one to answer "what does ESPN actually
+# think" — the user cannot see the weights from the table. So each platform's own number
+# sits beside the blend, and the plain unweighted mean sits beside both: where the mean
+# and the blend disagree, the difference *is* the weighting, which is the thing worth
+# noticing. Which platforms count is the user's call, so it is a filter.
 # ─────────────────────────────────────────────────────────────────────────────
-ADP_SOURCE_COLUMNS = ["ffc_adp", "espn_adp", "yahoo_adp"]
-RANK_SOURCE_COLUMNS = ["espn_rank", "yahoo_rank", "sleeper_rank"]
+class Platform(NamedTuple):
+    """One data source and the two kinds of column it can contribute.
+
+    ``None`` where a source does not publish that kind: Fantasy Football Calculator
+    reports draft position and never a ranking, Sleeper reports popularity and never a
+    draft position. Pretending either had both would put an empty column on the table.
+    """
+
+    name: str
+    adp_column: str | None
+    rank_column: str | None
+    what_it_is: str
+
+
+PLATFORMS: tuple[Platform, ...] = (
+    Platform(
+        "FFC", "ffc_adp", None,
+        "Fantasy Football Calculator — average pick across real public mock drafts. "
+        "The only source here that reports what drafters did rather than what a site "
+        "recommends.",
+    ),
+    Platform(
+        "ESPN", "espn_adp", "espn_rank",
+        "ESPN — average pick across ESPN leagues, plus ESPN's own published ranking.",
+    ),
+    Platform(
+        "Yahoo", "yahoo_adp", "yahoo_rank",
+        "Yahoo — average pick across Yahoo leagues, plus Yahoo's ranking.",
+    ),
+    Platform(
+        "Sleeper", None, "sleeper_rank",
+        "Sleeper — search popularity rather than a ranking. It leads ADP rather than "
+        "reporting it, so treat it as attention, not opinion.",
+    ),
+)
+
+PLATFORM_COLUMN_LABELS: dict[str, str] = {
+    "ffc_adp": "FFC ADP", "espn_adp": "ESPN ADP", "yahoo_adp": "Yahoo ADP",
+    "espn_rank": "ESPN rank", "yahoo_rank": "Yahoo rank", "sleeper_rank": "Sleeper",
+}
+"""Column name to header. One dict, used for both the rename and the column sets, so a
+relabelled header cannot silently drop out of a view."""
+
+
+def _coverage(column: str | None) -> int:
+    """How many players this source actually has. Zero means it did not load."""
+    if not column or column not in frame.columns:
+        return 0
+    return int(frame[column].notna().sum())
 
 
 def _row_mean(source_frame: pd.DataFrame, columns: list[str]) -> pd.Series:
@@ -51,10 +102,13 @@ def _row_mean(source_frame: pd.DataFrame, columns: list[str]) -> pd.Series:
     return source_frame[present].mean(axis=1, skipna=True)
 
 
-if not frame.empty:
-    frame["avg_source_adp"] = _row_mean(frame, ADP_SOURCE_COLUMNS).round(1)
-    frame["avg_source_rank"] = _row_mean(frame, RANK_SOURCE_COLUMNS).round(1)
-    frame["adp_vs_blend"] = (frame["avg_source_adp"] - frame["overall_adp"]).round(1)
+# Offered only where the source has at least one number in this pool. A platform that
+# failed to load, or that Setup switched off, is absent from the picker rather than
+# present and empty — a checkbox that does nothing is worse than no checkbox.
+AVAILABLE_PLATFORMS = [
+    platform for platform in PLATFORMS
+    if _coverage(platform.adp_column) or _coverage(platform.rank_column)
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Provenance — where these numbers came from
@@ -364,6 +418,99 @@ hide_injured = filter_columns[3].checkbox(
     "Hide injured", help="Drops anyone whose injury status is not Healthy."
 )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Which platforms count
+#
+# This drives three things at once, deliberately: which per-platform columns appear on
+# the table, which sources the plain average is taken over, and which per-platform sort
+# options are offered. One control, because a user who says "I only care about ESPN and
+# FFC" means all three.
+# ─────────────────────────────────────────────────────────────────────────────
+complete_only = False
+if not AVAILABLE_PLATFORMS:
+    # A pool imported from a single file, or a synthetic one. No picker, because there is
+    # nothing to pick between, and no empty columns on the table either.
+    selected_platforms: list[Platform] = []
+    st.caption(
+        "This pool carries no per-platform numbers, so there is nothing to compare: "
+        "every ADP and rank came from one source. Load a pool from **Setup** to get "
+        "each platform's own column."
+    )
+else:
+    platform_columns = st.columns([3, 1])
+    platform_choice = platform_columns[0].multiselect(
+        "Platforms",
+        [platform.name for platform in AVAILABLE_PLATFORMS],
+        default=[platform.name for platform in AVAILABLE_PLATFORMS],
+        format_func=lambda name: next(
+            f"{p.name} ({_coverage(p.adp_column) or _coverage(p.rank_column)} players)"
+            for p in AVAILABLE_PLATFORMS if p.name == name
+        ),
+        key="pool_platforms",
+        help="Which sources to show and average. Deselecting one removes its column, "
+             "drops it out of the Avg ADP and Avg rank calculations and takes it off "
+             "the sort list. It does **not** change what the engine drafts against — "
+             "that blend and its weights live on Settings.",
+    )
+    selected_platforms = [
+        platform for platform in AVAILABLE_PLATFORMS if platform.name in platform_choice
+    ]
+    if not selected_platforms:
+        # Falling back to everything rather than showing an averageless table, and saying
+        # so — a silent fallback would read as "these are your selected platforms".
+        st.info(
+            "No platform selected, so all of them are shown. Pick at least one to "
+            "narrow the table."
+        )
+        selected_platforms = list(AVAILABLE_PLATFORMS)
+    complete_only = platform_columns[1].checkbox(
+        "Only fully covered", key="pool_complete_only",
+        help="Keep only players that *every* selected platform has an ADP for. Useful "
+             "when comparing columns — a blank cell makes two platforms look like they "
+             "disagree when one of them simply never listed the player.",
+    )
+
+selected_adp_columns = [
+    platform.adp_column for platform in selected_platforms
+    if _coverage(platform.adp_column)
+]
+selected_rank_columns = [
+    platform.rank_column for platform in selected_platforms
+    if _coverage(platform.rank_column)
+]
+
+if not frame.empty:
+    frame["avg_source_adp"] = _row_mean(frame, selected_adp_columns).round(1)
+    frame["avg_source_rank"] = _row_mean(frame, selected_rank_columns).round(1)
+    frame["adp_vs_blend"] = (frame["avg_source_adp"] - frame["overall_adp"]).round(1)
+    frame["selected_adp_count"] = (
+        frame[selected_adp_columns].notna().sum(axis=1) if selected_adp_columns
+        else pd.Series(0, index=frame.index)
+    )
+
+if AVAILABLE_PLATFORMS:
+    with st.expander("What each platform is, and how much of the pool it covers"):
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Platform": platform.name,
+                    "Has ADP for": _coverage(platform.adp_column),
+                    "Has a rank for": _coverage(platform.rank_column),
+                    "Selected": "✓" if platform in selected_platforms else "",
+                    "What it is": platform.what_it_is,
+                }
+                for platform in AVAILABLE_PLATFORMS
+            ]),
+            width="stretch", hide_index=True,
+        )
+        st.caption(
+            f"Out of {len(frame)} players. A source with a low count is not broken — it "
+            "simply publishes a shorter list, which is why the average is taken over "
+            "whichever sources have the player rather than over all of them. A zero in "
+            "**Has a rank for** means that platform publishes draft position but no "
+            "ranking, so it has no column in the Ranks view."
+        )
+
 sort_columns = st.columns([2, 1, 1, 1])
 sort_options = {
     "ADP (earliest first)": ("overall_adp", True),
@@ -377,13 +524,13 @@ sort_options = {
     "Average ADP across sources": ("avg_source_adp", True),
     "Average rank across sources": ("avg_source_rank", True),
     "Consensus rank": ("overall_rank", True),
-    "ESPN rank": ("espn_rank", True),
-    "Yahoo rank": ("yahoo_rank", True),
-    "ESPN ADP": ("espn_adp", True),
-    "Yahoo ADP": ("yahoo_adp", True),
-    "Fantasy Football Calculator ADP": ("ffc_adp", True),
-    "Sleeper popularity": ("sleeper_rank", True),
 }
+# Per-platform sorts for the selected platforms only, so deselecting a source removes it
+# from here too rather than leaving an option that sorts by a column no longer shown.
+for _column in selected_adp_columns:
+    sort_options[f"{PLATFORM_COLUMN_LABELS[_column]} (earliest first)"] = (_column, True)
+for _column in selected_rank_columns:
+    sort_options[f"{PLATFORM_COLUMN_LABELS[_column]} (best first)"] = (_column, True)
 if board.custom_ranks:
     # Offered only when there is something to sort by, so the option never appears
     # and then silently falls back to ADP.
@@ -397,9 +544,10 @@ tier_choice = sort_columns[2].multiselect("Tiers", tiers)
 column_set = sort_columns[3].radio(
     "Columns",
     ["Value", "ADP by platform", "Ranks by platform"],
-    help="Value shows the blended board. The other two show each source's own number "
-         "side by side with the plain average, so you can see where the platforms "
-         "disagree and where the blend's weighting is doing the work.",
+    help="All three carry each selected platform's own number. **Value** is the board "
+         "with projections, VOR and risk beside it. **ADP by platform** drops those to "
+         "make room for the spread between sources. **Ranks by platform** shows what "
+         "each site *says* rather than where players actually go.",
 )
 
 view = frame.copy()
@@ -444,6 +592,8 @@ if hide_injured:
     view = view[view["injury_status"].astype(str).str.lower().isin({"healthy", "", "nan"})]
 if tier_choice:
     view = view[view["tier"].isin(tier_choice)]
+if complete_only and selected_adp_columns and "selected_adp_count" in view.columns:
+    view = view[view["selected_adp_count"] >= len(selected_adp_columns)]
 
 sort_field, ascending = sort_options[sort_choice]
 if sort_field not in view.columns:
@@ -474,8 +624,7 @@ display = view.head(int(row_limit)).rename(columns={
     "overall_adp": "ADP", "adp_stdev": "ADP σ",
     "value_over_replacement": "VOR", "ceiling": "Ceiling", "floor": "Floor",
     "risk_score": "Risk", "is_rookie": "Rookie", "injury_status": "Injury",
-    "ffc_adp": "FFC ADP", "espn_adp": "ESPN ADP", "espn_rank": "ESPN rank",
-    "yahoo_adp": "Yahoo ADP", "yahoo_rank": "Yahoo rank", "sleeper_rank": "Sleeper",
+    **PLATFORM_COLUMN_LABELS,
     "adp_source_count": "Sources", "adp_disagreement": "Disagreement",
     "avg_source_adp": "Avg ADP", "avg_source_rank": "Avg rank",
     "adp_vs_blend": "Avg − blend",
@@ -483,17 +632,27 @@ display = view.head(int(row_limit)).rename(columns={
     "board_mark": "My list", "my_rank": "My rank",
 })
 
+# Headers for the selected platforms, in registry order so the columns do not reshuffle
+# when the user changes the selection.
+selected_adp_labels = [PLATFORM_COLUMN_LABELS[c] for c in selected_adp_columns]
+selected_rank_labels = [PLATFORM_COLUMN_LABELS[c] for c in selected_rank_columns]
+
+# Every view carries the per-platform columns, including the default one. They used to
+# live only in the two "by platform" views, which meant the answer to "what does each
+# site say about this player" was behind a radio button in the corner of the filter row —
+# findable, but only if you already knew it was there.
 VALUE_COLUMNS = [
-    "Player", "Pos", "Team", "Bye", "Tier", "ADP", "ADP σ", "Sources",
+    "Player", "Pos", "Team", "Bye", "Tier",
+    "ADP", *selected_adp_labels, "Avg ADP", "Sources",
     "Proj", "VOR", "Ceiling", "Floor", "Risk", "Rookie", "Injury",
 ]
 ADP_PLATFORM_COLUMNS = [
     "Player", "Pos", "Team", "Tier", "ADP", "Avg ADP", "Avg − blend",
-    "FFC ADP", "ESPN ADP", "Yahoo ADP", "Sources", "Disagreement", "ADP σ",
+    *selected_adp_labels, "Sources", "Disagreement", "ADP σ",
 ]
 RANK_PLATFORM_COLUMNS = [
     "Player", "Pos", "Team", "Tier", "Rank", "Avg rank",
-    "ESPN rank", "Yahoo rank", "Sleeper", "PosRank", "PlatRank", "Proj", "VOR",
+    *selected_rank_labels, "PosRank", "PlatRank", "Proj", "VOR",
 ]
 wanted = {
     "Value": VALUE_COLUMNS,
@@ -504,7 +663,16 @@ if not board.is_empty:
     # Beside the name, where a marker is read rather than hunted for.
     wanted = [wanted[0], "My list", "My rank", *wanted[1:]]
 
-if column_set == "ADP by platform":
+if column_set == "Value" and selected_adp_labels:
+    st.caption(
+        "`ADP` is the weighted blend the engine drafts against; "
+        + ", ".join(f"`{label}`" for label in selected_adp_labels)
+        + " are each platform's own number, unmodified; and `Avg ADP` is the plain "
+        "unweighted mean of them. A blank cell means that platform never listed the "
+        "player, not that it rates him badly. Switch to **ADP by platform** for the "
+        "spread between sources, or **Ranks by platform** for what the sites say."
+    )
+elif column_set == "ADP by platform":
     st.caption(
         "**ADP is where a player actually goes; rank is where a site says he should "
         "go.** They differ, and the gap is often the interesting part. `ADP` is the "
@@ -557,6 +725,31 @@ st.dataframe(
             "Sources", format="%d",
             help="How many ADP sources had this player. A blended ADP from one source "
                  "is a single opinion, not a consensus.",
+        ),
+        "FFC ADP": st.column_config.NumberColumn(
+            "FFC ADP", format="%.1f",
+            help="Fantasy Football Calculator's average draft position — where this "
+                 "player actually went in real public mock drafts. The only column here "
+                 "that reports behaviour rather than opinion.",
+        ),
+        "ESPN ADP": st.column_config.NumberColumn(
+            "ESPN ADP", format="%.1f",
+            help="Average pick across ESPN leagues. Blank means ESPN's list does not go "
+                 "deep enough to include him.",
+        ),
+        "Yahoo ADP": st.column_config.NumberColumn(
+            "Yahoo ADP", format="%.1f",
+            help="Average pick across Yahoo leagues. Blank means Yahoo's list does not "
+                 "include him.",
+        ),
+        "ESPN rank": st.column_config.NumberColumn(
+            "ESPN rank", format="%.0f",
+            help="ESPN's own published overall ranking — its stated opinion, which can "
+                 "differ sharply from where ESPN's own drafters take him.",
+        ),
+        "Yahoo rank": st.column_config.NumberColumn(
+            "Yahoo rank", format="%.0f",
+            help="Yahoo's published overall ranking.",
         ),
         "Avg ADP": st.column_config.NumberColumn(
             "Avg ADP", format="%.1f",
