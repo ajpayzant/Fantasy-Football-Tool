@@ -218,7 +218,13 @@ class ManagerProfile:
     favorite_teams: dict[str, float] = field(default_factory=dict)
     """NFL team → share of this manager's picks."""
     repeat_players: dict[str, int] = field(default_factory=dict)
-    """Player name → times drafted across history (loyalty signal)."""
+    """Player name → how many *distinct seasons* this manager drafted him.
+
+    Only names with two or more seasons appear, so every entry is a loyalty signal by
+    construction. Counted in seasons rather than picks on purpose: drafting someone
+    twice in one season says nothing about liking him, and two mocks of the same league
+    would otherwise read as devotion.
+    """
     sample_picks: float = 0.0
     sample_drafts: int = 0
     seasons_seen: tuple[int, ...] = ()

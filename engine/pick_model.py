@@ -72,6 +72,16 @@ Deliberately neutral: a missing field is an absence of evidence, so it must
 neither reward nor punish the player.
 """
 
+REPEAT_SEASONS_SATURATION: float = 3.0
+"""Seasons of re-drafting at which the loyalty term is at full strength.
+
+Two seasons is a coincidence worth half the term; three or more is a pattern. Above
+that it saturates rather than growing without limit — a manager who has taken the same
+running back four years running is not eight times as attached as one who took him
+twice, and letting the term keep climbing would make an old favourite unbeatable by any
+board value.
+"""
+
 MAX_LOOKAHEAD_PICKS: int = 64
 """Cap on how many of a manager's future picks are enumerated per pick.
 
@@ -523,6 +533,39 @@ def _named_player_term(player: Player, profile: ManagerProfile) -> float:
     return 0.0
 
 
+def _repeat_player_term(player: Player, profile: ManagerProfile) -> float:
+    """Managers come back to players they have drafted before, in earlier seasons.
+
+    ``profile.repeat_players`` counts *distinct seasons*, and only players with two or
+    more are in it, so any entry here is already evidence of a habit rather than one
+    memorable pick. The term rises with the number of seasons and saturates at
+    :data:`REPEAT_SEASONS_SATURATION`.
+
+    Unlike :func:`_named_player_term` this is inferred from a draft history rather than
+    stated by the user, which is why it carries a smaller weight: "he took Kupp three
+    years running" is real evidence, but it is also consistent with Kupp simply being
+    the best player available at that manager's slot three years running.
+
+    Matched on :func:`services.normalize.player_key` so history spellings meet board
+    spellings — the two usually come from different sources.
+    """
+    repeats = profile.repeat_players
+    if not repeats:
+        return 0.0
+    key = player_key(player.name)
+    if not key:
+        return 0.0
+    for name, seasons in repeats.items():
+        if player_key(name) != key:
+            continue
+        count = float(seasons)
+        if count < 2:
+            return 0.0
+        span = max(1.0, REPEAT_SEASONS_SATURATION - 1.0)
+        return float(min(1.0, (count - 1.0) / span))
+    return 0.0
+
+
 def _stack_term(
     player: Player, view: RosterView, profile: ManagerProfile
 ) -> float:
@@ -750,6 +793,9 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
         player, profile
     )
     components["named_player"] = w.named_player_preference * _named_player_term(
+        player, profile
+    )
+    components["repeat_player"] = w.repeat_player_affinity * _repeat_player_term(
         player, profile
     )
     components["stack"] = w.stack * _stack_term(player, view, profile)

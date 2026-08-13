@@ -134,7 +134,15 @@ class ManagerObservations:
     first_round_by_position: dict[Position, WeightedStat] = field(default_factory=dict)
     position_rate_by_round: dict[int, dict[Position, float]] = field(default_factory=dict)
     team_share: dict[str, float] = field(default_factory=dict)
-    repeat_players: dict[str, int] = field(default_factory=dict)
+    player_seasons: dict[str, set[int]] = field(default_factory=dict)
+    """Player name → the distinct seasons this manager drafted him.
+
+    Seasons rather than a pick count, because the question being answered is "does
+    this manager keep coming back to him". Two picks inside one season — which happens
+    whenever the same league is mocked twice, or a draft file is imported twice — say
+    nothing about loyalty, and counting them was enough to mark half a pool as
+    favourites.
+    """
 
     @property
     def has_data(self) -> bool:
@@ -234,8 +242,8 @@ def observe_manager(
             team = pick.nfl_team.upper()
             team_weight[team] = team_weight.get(team, 0.0) + weight
         if pick.player_name:
-            observations.repeat_players[pick.player_name] = (
-                observations.repeat_players.get(pick.player_name, 0) + 1
+            observations.player_seasons.setdefault(pick.player_name, set()).add(
+                int(pick.season)
             )
 
     observations.weighted_picks = total_weight
@@ -637,8 +645,14 @@ def build_profile(
     _apply_positional_tendencies(profile, observations, fallbacks, settings)
     _apply_preference_adjustments(profile, manager.preferences, estimation)
     profile.favorite_teams = dict(observations.team_share)
+    # Only players taken in more than one *season* survive. A name drafted twice in the
+    # same season is a duplicate import or a second mock of the same draft, not a
+    # preference, and treating it as one put dozens of ordinary players on every
+    # manager's loyalty list.
     profile.repeat_players = {
-        name: count for name, count in observations.repeat_players.items() if count > 1
+        name: len(seasons)
+        for name, seasons in observations.player_seasons.items()
+        if len(seasons) > 1
     }
     profile.position_rate_by_round = {
         rnd: dict(rates) for rnd, rates in observations.position_rate_by_round.items()

@@ -374,6 +374,15 @@ class ModelWeights:
     Zero for every manager the user has said nothing about, so it changes no
     simulation until someone fills it in.
     """
+    repeat_player_affinity: float = 0.25
+    """Pull toward a player this manager has drafted in previous seasons.
+
+    Below ``named_player_preference`` deliberately. That weight acts on something the
+    user *stated*; this one acts on something inferred from a draft history, where
+    re-drafting the same player is also consistent with him simply having been the best
+    available at that slot each year. Zero for every manager with no repeat picks on
+    record, so it changes nothing until a history is imported.
+    """
     stack: float = 0.15
     handcuff: float = 0.15
     positional_run: float = 0.30

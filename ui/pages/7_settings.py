@@ -60,6 +60,10 @@ WEIGHT_HELP: dict[str, str] = {
                                "named for them on **Manager Profiles**, and avoids the "
                                "ones you said they will not touch. Does nothing until "
                                "you name someone.",
+    "repeat_player_affinity": "How hard a manager chases a player they have drafted in "
+                              "*previous seasons*. Measured in seasons, not picks, so "
+                              "two mocks of one draft do not read as loyalty. Does "
+                              "nothing until a draft history is imported.",
     "stack": "Preference for pairing a quarterback with their own receivers.",
     "handcuff": "Preference for backing up a running back they already own.",
     "positional_run": "How strongly a run in progress drags the next pick toward the "
