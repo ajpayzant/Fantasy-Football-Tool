@@ -26,7 +26,8 @@ from core.constants import (
     SAMPLE_DATA_BANNER,
 )
 from core import stats as core_stats
-from core.enums import InjuryStatus, Platform, Position
+from core.config import ScoringRules
+from core.enums import InjuryStatus, Platform, Position, ProjectionMode
 from core.validation import (
     ValidationReport,
     require_columns,
@@ -37,8 +38,15 @@ from core.validation import (
 )
 from models.draft import DraftHistory, HistoricalDraft, HistoricalPick
 from models.league import Keeper
-from models.player import Player, PlayerPool, PoolMetadata
+from models.player import (
+    Player,
+    PlayerPool,
+    PoolMetadata,
+    ProjectionOutcome,
+    ProjectionUpdate,
+)
 from services.normalize import (
+    canonical_column,
     clean_text,
     dedupe_names,
     describe_column_mapping,
@@ -539,6 +547,22 @@ def import_player_pool(
     pool = PlayerPool(players, league=league, metadata=metadata)
     result.pool = pool
 
+    # A file carrying stat lines is scored here rather than trusted to have arrived
+    # pre-scored. Without this, a ``stat_totals`` column and no ``projection`` column —
+    # which is exactly what the template above invites — produced a board where every
+    # projection was estimated from draft position while the real stats sat unused.
+    # Where a file gives both, the stats win: they are scored under *this* league's
+    # rules, and a points column was scored under rules nobody recorded.
+    if league is not None and any(p.stat_totals for p in players):
+        rescored = pool.rescore(league.scoring)
+        if rescored.rescored:
+            report.info(
+                "scored_from_stats",
+                f"{rescored.rescored} projection(s) were computed from the stat "
+                "columns in your file under your league's scoring rules, so changing "
+                "those rules later will update them without a re-import.",
+            )
+
     if league is not None:
         report.extend(validate_player_pool(pool.to_frame(), league))
     if metadata.imputed_fields:
@@ -576,6 +600,350 @@ def player_template() -> pd.DataFrame:
         }),
     }
     return pd.DataFrame([example], columns=list(PLAYER_IMPORT_COLUMNS))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Projections
+# ─────────────────────────────────────────────────────────────────────────────
+# Headers that mean something to this importer without being stats. Everything else
+# is offered to ``core_stats.canonical_field`` and reported if it lands nowhere.
+_PROJECTION_IDENTITY_COLUMNS: frozenset[str] = frozenset(
+    {"player_name", "position", "nfl_team", "projection", "stat_totals"}
+)
+PROJECTION_REQUIRED_COLUMNS: tuple[str, ...] = ("player_name",)
+
+
+@dataclass(slots=True)
+class ProjectionImportResult:
+    """Outcome of overlaying uploaded projections onto an existing board."""
+
+    report: ValidationReport = field(default_factory=ValidationReport)
+    column_mapping: dict[str, str] = field(default_factory=dict)
+    stat_columns: dict[str, str] = field(default_factory=dict)
+    """``{your header: canonical stat}`` — shown back so a user can check the reading."""
+    ignored_columns: list[str] = field(default_factory=list)
+    """Headers this app could not place. The usual reason a total looks too low."""
+    updates: list[ProjectionUpdate] = field(default_factory=list)
+    unmatched: list[str] = field(default_factory=list)
+    """Names with no player on the board — a different season, or a spelling."""
+    ambiguous: list[str] = field(default_factory=list)
+    """Names matching more than one player, where the file gave no position to split them."""
+    thin: list[str] = field(default_factory=list)
+    """Rows whose stats score no points at all — usually the wrong columns were read."""
+    accepted_rows: int = 0
+    rejected_rows: int = 0
+    outcome: ProjectionOutcome | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.report.ok and bool(self.outcome and self.outcome.applied)
+
+    def mapping_frame(self) -> pd.DataFrame:
+        return describe_column_mapping(self.column_mapping)
+
+    def preview(self, limit: int = 25) -> pd.DataFrame:
+        """What was read, per player, for eyeballing before trusting it."""
+        rows = [
+            {
+                "Player": update.name,
+                "Points you gave": update.points,
+                "Stats read": core_stats.describe(update.stat_totals) or "—",
+            }
+            for update in self.updates[:limit]
+        ]
+        return pd.DataFrame(rows, columns=["Player", "Points you gave", "Stats read"])
+
+
+def _projection_headers(
+    frame: pd.DataFrame,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Split a projection file's headers into identity, stat and unusable.
+
+    Stats are resolved first and identity columns second, because the two vocabularies
+    overlap in one direction only: ``core.stats`` has no entry for ``player``, ``pos``
+    or ``fpts``, while :data:`services.normalize.COLUMN_ALIASES` would happily turn a
+    stat header into something unrelated.
+    """
+    identity: dict[str, str] = {}
+    stats: dict[str, str] = {}
+    ignored: list[str] = []
+    for original in frame.columns:
+        header = str(original)
+        stat = core_stats.canonical_field(header)
+        if stat is not None:
+            stats[header] = stat
+            continue
+        column = canonical_column(header)
+        if column in _PROJECTION_IDENTITY_COLUMNS:
+            identity[header] = column
+            continue
+        ignored.append(header)
+    return identity, stats, ignored
+
+
+def import_projections(
+    frame: pd.DataFrame,
+    *,
+    pool: PlayerPool,
+    scoring: ScoringRules,
+    mode: ProjectionMode | str = ProjectionMode.REPLACE,
+    source: str = "your uploaded projections",
+) -> ProjectionImportResult:
+    """Read a projection sheet and apply it to ``pool``.
+
+    Two shapes of file are accepted, and the difference matters enough that the result
+    reports which one each row was:
+
+    * **Stat columns** — carries, receptions, pass yards and so on, under any of the
+      spellings :func:`core.stats.canonical_field` knows. Scored here under the
+      league's own rules, which means the same arithmetic that scores a fetched
+      projection, and means a later scoring change rescores it rather than stranding it.
+    * **A points column** — ``projection``, ``fpts``, ``fantasy points``. Taken as
+      given. Universal, because every projection sheet ever exported has one, but
+      frozen: nothing in the file says what rules produced it.
+
+    Matching is by name, tightened by position where the file supplies one. Nothing is
+    dropped in silence: unmatched names, ambiguous names, ignored columns and rows too
+    thin to trust all come back on the result for the UI to show.
+    """
+    result = ProjectionImportResult()
+    report = result.report
+    resolved_mode = (
+        ProjectionMode.coerce(mode, ProjectionMode.REPLACE) or ProjectionMode.REPLACE
+    )
+
+    if frame is None or frame.empty:
+        report.error("empty_input", "No rows to import.")
+        return result
+    if pool is None or not len(pool):
+        report.error(
+            "no_pool",
+            "Load a player pool first — uploaded projections are applied to the "
+            "players already on the board, so there has to be a board.",
+        )
+        return result
+
+    identity, stat_columns, ignored = _projection_headers(frame)
+    result.stat_columns = stat_columns
+    result.ignored_columns = ignored
+    result.column_mapping = {**identity, **stat_columns}
+    if "player_name" not in identity.values():
+        report.error(
+            "missing_player_name",
+            "No player-name column found. One column has to hold the player's name — "
+            "`player`, `name` and `player_name` are all understood.",
+        )
+        return result
+    if not stat_columns and "projection" not in identity.values():
+        report.error(
+            "nothing_to_import",
+            "Found names but no projection: give either a points column (`projection`, "
+            "`fpts`) or stat columns (`rush_yds`, `rec`, `pass_td`, …).",
+        )
+        return result
+
+    # Reverse the identity map so a row can be read by canonical name. First header
+    # wins, matching ``normalize_columns``' behaviour for duplicates.
+    column_for: dict[str, str] = {}
+    for header, column in identity.items():
+        column_for.setdefault(column, header)
+
+    # Two indexes: name+position is the trustworthy one, bare name is the fallback for
+    # files that do not carry a position. A bare name matching two players is reported
+    # rather than resolved by guessing which one the user meant.
+    by_key: dict[str, str] = {}
+    by_name: dict[str, list[str]] = {}
+    for player in pool.players:
+        by_key.setdefault(player_key(player.name, player.position), player.player_id)
+        by_name.setdefault(player_key(player.name), []).append(player.player_id)
+
+    rejected: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
+    for index, raw in frame.iterrows():
+        name = normalize_player_name(raw.get(column_for.get("player_name", "")))
+        if not name:
+            _reject(rejected, raw, index, "player_name is blank")
+            continue
+        position = (
+            normalize_position(raw.get(column_for["position"]))
+            if "position" in column_for
+            else None
+        )
+
+        stat_totals = core_stats.normalise(
+            {stat: raw.get(header) for header, stat in stat_columns.items()}
+        )
+        if "stat_totals" in column_for:
+            # Our own template's JSON column, so a board exported from this app can be
+            # edited in a spreadsheet and fed straight back in.
+            stat_totals = core_stats.merge(
+                core_stats.from_frame_value(raw.get(column_for["stat_totals"])),
+                stat_totals,
+            )
+        points = (
+            to_float(raw.get(column_for["projection"]))
+            if "projection" in column_for
+            else None
+        )
+        if not stat_totals and points is None:
+            _reject(rejected, raw, index, "no stats and no points on this row")
+            continue
+
+        player_id = None
+        if position is not None:
+            player_id = by_key.get(player_key(name, position))
+        if player_id is None:
+            candidates = by_name.get(player_key(name), [])
+            if len(candidates) == 1:
+                player_id = candidates[0]
+            elif candidates:
+                result.ambiguous.append(name)
+                _reject(
+                    rejected, raw, index,
+                    f"'{name}' matches {len(candidates)} players — add a position "
+                    "column to say which",
+                )
+                continue
+        if player_id is None:
+            result.unmatched.append(name)
+            _reject(rejected, raw, index, f"'{name}' is not on the loaded board")
+            continue
+        if player_id in seen:
+            _reject(
+                rejected, raw, index,
+                f"duplicate of '{seen[player_id]}' — the first row for a player wins",
+            )
+            continue
+        seen[player_id] = name
+
+        # The board's position beats the file's: the pool is what the projection will be
+        # attached to, and a sheet listing a converted tight end as a receiver would
+        # otherwise be scored against the wrong set of stats.
+        matched = pool.get(player_id)
+        scored_as = matched.position if matched is not None else position
+        if stat_totals and core_stats.score(stat_totals, scored_as, scoring) is None:
+            # Stats were read, but none of them are stats this league pays for — the
+            # classic symptom of a sheet whose only recognised headers were targets,
+            # attempts and games played. Keeping them would be worse than dropping
+            # them: ``apply_projections`` prefers a stat line over a points total, so an
+            # unscorable line would suppress the points column on the same row.
+            read = core_stats.summarise_fields(sorted(stat_totals))
+            result.thin.append(f"{name} (read {read})")
+            stat_totals = {}
+            if points is None:
+                _reject(
+                    rejected, raw, index,
+                    f"the only stats read from this row ({read}) are not ones that "
+                    "score points",
+                )
+                del seen[player_id]
+                continue
+
+        result.updates.append(
+            ProjectionUpdate(
+                player_id=player_id,
+                name=name,
+                stat_totals=stat_totals,
+                points=points,
+            )
+        )
+
+    _attach_rejected(report, rejected)
+    result.rejected_rows = len(rejected)
+    result.accepted_rows = len(result.updates)
+
+    if stat_columns:
+        report.info(
+            "stat_columns",
+            f"Read {len(stat_columns)} stat column(s): "
+            + ", ".join(
+                f"{header} → {core_stats.STAT_LABELS.get(stat, stat)}"
+                for header, stat in stat_columns.items()
+            )
+            + ".",
+        )
+    if ignored:
+        report.warn(
+            "ignored_columns",
+            f"{len(ignored)} column(s) were not used because this app has no stat by "
+            "that name: " + ", ".join(ignored[:10])
+            + ". Rename them to the accepted spellings if they should count — an "
+            "ignored column is the usual reason an uploaded projection comes out low.",
+        )
+    if result.unmatched:
+        report.warn(
+            "unmatched_players",
+            f"{len(result.unmatched)} name(s) are not on the loaded board and were "
+            "skipped: " + ", ".join(result.unmatched[:8])
+            + ". Load the pool those players are in first, or check the spelling.",
+        )
+    if result.ambiguous:
+        report.warn(
+            "ambiguous_players",
+            f"{len(result.ambiguous)} name(s) matched more than one player: "
+            + ", ".join(result.ambiguous[:8])
+            + ". Add a position column so they can be told apart.",
+        )
+    if result.thin:
+        report.warn(
+            "thin_rows",
+            f"{len(result.thin)} row(s) had stats read from them that score no points "
+            "in this league, so the stats were dropped: "
+            + ", ".join(result.thin[:6])
+            + ". Yardage, touchdowns and receptions are what a projection is built "
+            "from; attempts, targets and games played are not scored on their own.",
+        )
+    if not result.updates:
+        report.error(
+            "no_projections_applied",
+            "No uploaded row could be matched to a player on the board.",
+        )
+        return result
+
+    result.outcome = pool.apply_projections(
+        result.updates, scoring=scoring, mode=resolved_mode, source=source
+    )
+    report.info("projection_summary", result.outcome.describe())
+    LOGGER.info(
+        "Applied %s uploaded projection(s) from %s in %s mode",
+        result.outcome.applied, source, resolved_mode,
+    )
+    return result
+
+
+def projection_template() -> pd.DataFrame:
+    """A projections template: two stat rows and one points-only row.
+
+    Deliberately shows both shapes. A user who can only export points can still use
+    the tool, and a user who can export stats can see that they get more by doing so.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "player_name": "Example Quarterback", "position": "QB",
+                "pass_attempts": 560, "pass_completions": 370, "pass_yards": 4300,
+                "pass_td": 30, "interceptions": 11, "rush_attempts": 60,
+                "rush_yards": 320, "rush_td": 3, "receptions": "", "rec_yards": "",
+                "rec_td": "", "fumbles_lost": 5, "games": 17, "projection": "",
+            },
+            {
+                "player_name": "Example Running Back", "position": "RB",
+                "pass_attempts": "", "pass_completions": "", "pass_yards": "",
+                "pass_td": "", "interceptions": "", "rush_attempts": 260,
+                "rush_yards": 1180, "rush_td": 9, "receptions": 56, "rec_yards": 480,
+                "rec_td": 3, "fumbles_lost": 2, "games": 17, "projection": "",
+            },
+            {
+                # Points only: no stats, so this one is frozen at your current scoring
+                # rules rather than rescored when you change them.
+                "player_name": "Example Receiver", "position": "WR",
+                "pass_attempts": "", "pass_completions": "", "pass_yards": "",
+                "pass_td": "", "interceptions": "", "rush_attempts": "",
+                "rush_yards": "", "rush_td": "", "receptions": "", "rec_yards": "",
+                "rec_td": "", "fumbles_lost": "", "games": "", "projection": 240.5,
+            },
+        ]
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,4 +1047,6 @@ __all__ = [
     "import_keepers", "historical_template", "player_template",
     "keeper_template", "manual_history_frame", "rejected_rows_csv",
     "KEEPER_IMPORT_COLUMNS", "KEEPER_REQUIRED_COLUMNS",
+    "ProjectionImportResult", "import_projections", "projection_template",
+    "PROJECTION_REQUIRED_COLUMNS",
 ]

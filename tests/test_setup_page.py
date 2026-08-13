@@ -864,3 +864,151 @@ def test_lines_that_could_not_be_read_are_surfaced_not_dropped() -> None:
     _assert_clean(app)
     assert "could not be read" in _text(app)
     assert any("Import these 2 picks" in str(b.label) for b in app.button)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Uploading your own projections
+# ─────────────────────────────────────────────────────────────────────────────
+# The paste route is exercised rather than the file uploader: ``AppTest`` cannot
+# populate a ``file_uploader``, and both routes converge on the same importer one line
+# later. What is page-specific — the mode radio, the button, and what the page says
+# afterwards — is all reachable from here.
+def _board_app() -> AppTest:
+    """The Setup page with a small real board and a league already loaded."""
+    from core import stats as core_stats
+    from core.config import LeagueConfig, ScoringRules
+    from core.enums import Position, ScoringPreset
+    from models.league import League
+    from models.player import Player, PlayerPool, PoolMetadata
+    from ui import state as ui_state
+
+    scoring = ScoringRules.from_preset(ScoringPreset.HALF_PPR)
+    config = LeagueConfig(name="Test League", season=2026, scoring=scoring)
+    players = []
+    for index, (name, rec, yards, tds) in enumerate(
+        (
+            ("Alpha Receiver", 110.0, 1480.0, 11.0),
+            ("Bravo Receiver", 92.0, 1210.0, 8.0),
+            ("Charlie Receiver", 74.0, 980.0, 6.0),
+            ("Delta Receiver", 58.0, 720.0, 4.0),
+        ),
+        start=1,
+    ):
+        stats = {"receptions": rec, "rec_yards": yards, "rec_td": tds}
+        players.append(
+            Player(
+                player_id=f"{name.lower().replace(' ', '')}_wr",
+                name=name,
+                position=Position.WR,
+                projection=round(core_stats.score(stats, Position.WR, scoring), 1),
+                overall_adp=float(index * 6),
+                adp_stdev=2.0,
+                stat_totals=stats,
+            )
+        )
+    pool = PlayerPool(
+        players, league=config, metadata=PoolMetadata(source="my rankings.csv")
+    )
+
+    app = _app()
+    app.session_state[ui_state.K_LEAGUE] = League(config=config)
+    app.session_state[ui_state.K_POOL] = pool
+    return app.run()
+
+
+def _paste_projections(app: AppTest, text: str, mode: str | None = None) -> AppTest:
+    app.text_area(key="projections_paste").set_value(text)
+    if mode is not None:
+        app.radio(key="projections_mode").set_value(mode)
+    return app.button(key="apply_projections").click().run()
+
+
+def test_the_projection_upload_needs_a_board_first() -> None:
+    """It edits the loaded pool rather than replacing it, so it says so when empty."""
+    app = _app().run()
+    _assert_clean(app)
+    assert "Load a player pool first" in _text(app)
+
+
+def test_pasting_projections_moves_the_board_and_says_what_it_did() -> None:
+    from ui import state as ui_state
+
+    app = _board_app()
+    _assert_clean(app)
+    before = app.session_state[ui_state.K_POOL].get("alphareceiver_wr").projection
+
+    app = _paste_projections(
+        app,
+        "player,pos,rec,rec_yds,rec_td\nAlpha Receiver,WR,130,1900,15\n",
+    )
+    _assert_clean(app)
+
+    after = app.session_state[ui_state.K_POOL].get("alphareceiver_wr").projection
+    assert after > before + 50, f"projection went {before} → {after}"
+    text = _text(app)
+    assert "Applied your projections to 1 player" in text
+    assert "scored under your league rules" in text
+
+
+def test_a_pasted_points_column_is_flagged_as_unrescorable_on_the_page() -> None:
+    """The one thing a user cannot see for themselves, so the page has to say it."""
+    app = _board_app()
+    app = _paste_projections(app, "player,fpts\nBravo Receiver,275.5\n")
+    _assert_clean(app)
+
+    from ui import state as ui_state
+
+    assert app.session_state[ui_state.K_POOL].get(
+        "bravoreceiver_wr"
+    ).projection == pytest.approx(275.5)
+    assert "frozen at your current scoring rules" in _text(app)
+
+
+def test_a_column_the_page_could_not_place_is_shown_to_the_user() -> None:
+    app = _board_app()
+    app = _paste_projections(
+        app, "player,rec,rec_yds,rec_td,auction_value\nAlpha Receiver,120,1500,10,42\n"
+    )
+    _assert_clean(app)
+    assert "auction_value" in _text(app)
+
+
+def test_a_name_the_board_does_not_have_is_reported_on_the_page() -> None:
+    app = _board_app()
+    app = _paste_projections(app, "player,fpts\nNobody At All,300\n")
+    _assert_clean(app)
+    text = _text(app)
+    assert "Nobody At All" in text
+    assert "not on the loaded board" in text or "not on the loaded board" in " ".join(
+        str(block.value) for block in app.warning
+    )
+
+
+def test_the_fill_gaps_mode_is_offered_and_respected() -> None:
+    """Chosen through the rendered radio, because the mapping from label to mode is
+    page code and a mislabelled option would apply the wrong one silently."""
+    from ui import state as ui_state
+
+    app = _board_app()
+    before = app.session_state[ui_state.K_POOL].get("alphareceiver_wr").projection
+
+    app = _paste_projections(
+        app, "player,fpts\nAlpha Receiver,50\n", mode="Only fill the gaps"
+    )
+    _assert_clean(app)
+
+    after = app.session_state[ui_state.K_POOL].get("alphareceiver_wr").projection
+    assert after == before, "fill-gaps must not overwrite a real projection"
+    assert "left alone" in _text(app)
+
+
+def test_applying_projections_offers_no_route_to_a_refetch() -> None:
+    """The point of storing stat lines: your own numbers need no network round trip."""
+    app = _board_app()
+    app = _paste_projections(
+        app, "player,rec,rec_yds,rec_td\nAlpha Receiver,130,1900,15\n"
+    )
+    _assert_clean(app)
+    success = " ".join(str(block.value) for block in app.success)
+    assert "download" not in success.lower()
+    assert "refetch" not in success.lower()

@@ -11,7 +11,7 @@ import pandas as pd
 from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules
 from core.constants import SLOT_ELIGIBILITY, SLOT_FILL_PRIORITY
-from core.enums import InjuryStatus, Position, RankingSource, Slot
+from core.enums import InjuryStatus, Position, ProjectionMode, RankingSource, Slot
 
 # Injury statuses that make a player undraftable-ish; scored as a penalty, not
 # a hard filter, because managers do stash injured players.
@@ -43,6 +43,19 @@ _RISK_WEIGHT_ROOKIE = 0.10
 # fixed ratio rather than the pool's own worst case keeps a risk score comparable
 # between a 200-player board and a 400-player one.
 _DISAGREEMENT_AT_FULL_RISK = 0.40
+
+# The two ``projection_source`` strings this app writes itself. Named, because
+# :meth:`PlayerPool.rescore` has to be able to tell its own placeholder from a line a
+# provider or a user wrote: it may replace the former and must never overwrite the
+# latter. Before they were named, a projection scored from a stat line kept whichever
+# of these was set at import time and went on claiming to be an estimate.
+IMPUTED_PROJECTION_SOURCE = (
+    "Estimated from draft position — no real projection was supplied for this player"
+)
+GENERIC_PROJECTION_SOURCE = "Supplied by your source"
+STAT_LINE_PROJECTION_SOURCE = (
+    "Computed from this player's projected stat line under your league's scoring rules"
+)
 
 
 def _read_curve(slots: np.ndarray, curve: np.ndarray, at: float) -> float:
@@ -267,6 +280,81 @@ class RescoreOutcome:
 
 
 @dataclass(slots=True)
+class ProjectionUpdate:
+    """One player's projection as supplied by the user, already matched to the board.
+
+    ``player_id`` is resolved by the importer, not here: matching a spreadsheet name
+    to a board name needs the alias and suffix handling that lives in
+    :mod:`services.normalize`, and this module deliberately depends on nothing below
+    :mod:`core`. By the time an update reaches the pool the hard part is done.
+
+    ``stat_totals`` and ``points`` are both optional but at least one is present.
+    Stats are strictly better: they survive a scoring change (see
+    :meth:`PlayerPool.rescore`), a points total cannot.
+    """
+
+    player_id: str
+    name: str = ""
+    stat_totals: dict[str, float] = field(default_factory=dict)
+    points: float | None = None
+
+
+@dataclass(slots=True)
+class ProjectionOutcome:
+    """What :meth:`PlayerPool.apply_projections` did, in terms a user can check.
+
+    Counts rather than a boolean because an upload is almost never total: a sheet
+    covers 200 of 400 players, gives stats for some and a points total for others, and
+    names a handful the board has never heard of. Reporting that is the difference
+    between a user trusting the board and wondering why their sleeper did not move.
+    """
+
+    from_stats: int = 0
+    """Players whose projection now comes from stats you uploaded."""
+    from_points: int = 0
+    """Players given a points total with no stats behind it — frozen at these rules."""
+    blended: int = 0
+    """Players whose projection is an average of yours and the board's."""
+    skipped_had_real: int = 0
+    """Fill-gaps only: players left alone because a real projection was already there."""
+    partial_merge: int = 0
+    """Players where stats your file did not mention were kept from the old projection."""
+    unmatched_ids: list[str] = field(default_factory=list)
+    """Updates naming a player the pool no longer holds — a stale match list."""
+    rescore: RescoreOutcome | None = None
+    """The rescore that turned the new stat lines into points."""
+
+    @property
+    def applied(self) -> int:
+        return self.from_stats + self.from_points
+
+    def describe(self) -> str:
+        bits = []
+        if self.from_stats:
+            bits.append(
+                f"{self.from_stats} projection{_s(self.from_stats)} built from your "
+                f"stat line{_s(self.from_stats)} and scored under your league rules"
+            )
+        if self.from_points:
+            bits.append(
+                f"{self.from_points} taken as your points total"
+                f"{_s(self.from_points)} as-is"
+            )
+        if self.blended:
+            bits.append(f"{self.blended} averaged with what was already there")
+        if self.skipped_had_real:
+            bits.append(
+                f"{self.skipped_had_real} left alone (a real projection was already "
+                "on the board)"
+            )
+        if not bits:
+            # Reached when every row matched a player and none of them were used, which
+            # is not the same as "nothing matched" and must not be reported as if it were.
+            return "Nothing was applied — no uploaded row matched a player on the board."
+        return "; ".join(bits) + "."
+
+
+@dataclass(slots=True)
 class PoolMetadata:
     """Provenance for a loaded player pool — surfaced verbatim in the UI."""
 
@@ -423,10 +511,18 @@ class PlayerPool:
                 # reading the flag first would throw those stats away.
                 player.projection = round(float(points), 1)
                 player.expected_points = player.projection
-                player.projection_imputed = False
                 player.projection_detail = core_stats.describe(
                     player.stat_totals, player.position
                 )
+                if player.projection_imputed or player.projection_source in {
+                    "", GENERIC_PROJECTION_SOURCE
+                }:
+                    # Only ever replaces this app's own placeholder text. A provider's
+                    # or an upload's own line says something the app does not know and
+                    # is left exactly as written — but "estimated from draft position"
+                    # is now a lie about a number computed from real stats.
+                    player.projection_source = STAT_LINE_PROJECTION_SOURCE
+                player.projection_imputed = False
                 outcome.rescored += 1
                 continue
             if player.projection_imputed:
@@ -443,7 +539,17 @@ class PlayerPool:
 
         if not outcome.changed:
             return outcome
+        self._rederive_from_projections()
+        return outcome
 
+    def _rederive_from_projections(self) -> None:
+        """Throw away everything read off the projection curve and derive it again.
+
+        Called whenever projections move, by a scoring change or by an upload. Tiers
+        and outcome bands a *source* supplied are kept — they are identifiable by an
+        empty ``tier_source`` / ``outcome_band_source``, which is only ever written
+        when this app derived the value itself.
+        """
         for player in self._players:
             if player.tier_source:
                 player.tier = None
@@ -463,6 +569,103 @@ class PlayerPool:
             self._impute_core_fields()
             self._invalidate_caches()
             self._draft_order_hint = self._compute_order_hint()
+
+    def apply_projections(
+        self,
+        updates: Sequence[ProjectionUpdate],
+        *,
+        scoring: ScoringRules,
+        mode: ProjectionMode = ProjectionMode.REPLACE,
+        source: str = "your uploaded projections",
+    ) -> ProjectionOutcome:
+        """Overlay user-supplied projections onto this board and re-derive everything.
+
+        A stat line and a points total are handled very differently on purpose:
+
+        * **Stats** are merged into the player's stored line field by field and then
+          scored by :meth:`rescore` under ``scoring``, so they behave exactly like a
+          fetched projection — including surviving a later scoring change. Merging
+          field by field means a sheet carrying only receiving numbers does not erase
+          a running back's rushing projection; the count is reported so the UI can say
+          the projection is a hybrid rather than leaving the user to guess.
+        * **A points total** is taken as given and the player's stat line is *cleared*.
+          Keeping the old stats would mean the next scoring change silently threw the
+          user's own number away and went back to the provider's — the projection on
+          screen would not be the one they uploaded, and nothing would say so.
+
+        ``mode`` decides what happens where the board already has a projection: the
+        user's number wins (``REPLACE``), the two are averaged (``BLEND``), or the
+        upload only fills players whose projection was estimated or absent
+        (``FILL_GAPS``).
+        """
+        outcome = ProjectionOutcome()
+        touched = False
+        for update in updates:
+            player = self._by_id.get(update.player_id)
+            if player is None:
+                outcome.unmatched_ids.append(update.player_id or update.name)
+                continue
+            # An estimate is not a real projection, so nothing here treats it as one:
+            # it is not worth blending against and it never blocks a fill-gaps upload.
+            had_real = player.projection is not None and not player.projection_imputed
+            if mode is ProjectionMode.FILL_GAPS and had_real:
+                outcome.skipped_had_real += 1
+                continue
+
+            if update.stat_totals:
+                base = player.stat_totals
+                if mode is ProjectionMode.BLEND and had_real and base:
+                    merged = _blend_stats(base, update.stat_totals)
+                    outcome.blended += 1
+                else:
+                    merged = core_stats.merge(base, update.stat_totals)
+                kept = set(merged) - set(update.stat_totals)
+                if kept:
+                    outcome.partial_merge += 1
+                player.stat_totals = merged
+                player.projection_imputed = False
+                player.projection_source = (
+                    f"From {source}, scored under your league's rules"
+                    if not kept
+                    else f"From {source}, with stats your file did not give kept from "
+                         "the previous projection, scored under your league's rules"
+                )
+                outcome.from_stats += 1
+                touched = True
+                continue
+
+            if update.points is None:
+                continue
+            points = float(update.points)
+            if mode is ProjectionMode.BLEND and had_real:
+                points = (points + float(player.projection or 0.0)) / 2.0
+                outcome.blended += 1
+            player.projection = round(points, 1)
+            player.expected_points = player.projection
+            player.projection_imputed = False
+            # Cleared deliberately — see the docstring. The detail line goes with it,
+            # because it described stats that no longer explain this number.
+            player.stat_totals = {}
+            player.projection_detail = ""
+            player.projection_source = (
+                f"A points total from {source} — a scoring change cannot rescore this, "
+                "because the file gave points rather than stats"
+            )
+            outcome.from_points += 1
+            touched = True
+
+        if not touched:
+            return outcome
+
+        # Rescore turns the stat lines just written into points, re-derives the
+        # estimated tail on the new scale, and re-derives tiers, bands and VOR. It
+        # leaves points-only players exactly as set above: no stat line and not
+        # imputed is its "left as-is" case.
+        outcome.rescore = self.rescore(scoring)
+        if not outcome.rescore.changed:
+            # Nothing had a stat line, so rescore returned early without re-deriving —
+            # but points-only uploads still moved the board out from under the tiers.
+            self._rederive_from_projections()
         return outcome
 
     def _impute_core_fields(self) -> None:
@@ -538,17 +741,14 @@ class PlayerPool:
                 # Said plainly, because this is a restatement of draft position rather
                 # than an opinion about the player. A user comparing two projections
                 # needs to know when one of them is really just an ADP.
-                player.projection_source = (
-                    "Estimated from draft position — no real projection was supplied "
-                    "for this player"
-                )
+                player.projection_source = IMPUTED_PROJECTION_SOURCE
             else:
                 # Cleared, not left alone: a player who was imputed earlier and has
                 # since been given a real projection is no longer an estimate, and a
                 # stale flag would make :meth:`rescore` discard the real number.
                 player.projection_imputed = False
                 if not player.projection_source:
-                    player.projection_source = "Supplied by your source"
+                    player.projection_source = GENERIC_PROJECTION_SOURCE
             if player.expected_points is None:
                 player.expected_points = player.projection
             if player.adp_stdev is None:
@@ -907,6 +1107,31 @@ class PlayerPool:
         """Build a pool from an already-normalised frame."""
         players = [player_from_row(row) for _, row in frame.iterrows()]
         return cls(players, league=league, metadata=metadata)
+
+
+def _blend_stats(
+    base: dict[str, float], override: dict[str, float]
+) -> dict[str, float]:
+    """Average two stat lines field by field, keeping fields only one side has.
+
+    The stat line is averaged rather than the points, so the stored line still explains
+    the projection and a later scoring change rescores the blend instead of discarding
+    it. Scoring is linear in every stat, so averaging the stats and averaging the points
+    give the same answer anyway — this way just stays honest about where it came from.
+
+    A field only one side mentions is taken as-is rather than halved: silence is not a
+    projection of zero, and halving one source's 1,200 rushing yards because the other
+    sheet had no rushing column would invent a number neither source claims.
+    """
+    out = dict(base)
+    for field_name, value in override.items():
+        if field_name not in core_stats.STAT_FIELD_SET:
+            continue
+        if field_name in out:
+            out[field_name] = (float(out[field_name]) + float(value)) / 2.0
+        else:
+            out[field_name] = float(value)
+    return out
 
 
 def _name_key(name: str) -> str:

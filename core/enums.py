@@ -196,6 +196,18 @@ class RiskBand(StrEnum):
     SAFE = "very_likely_available"
 
 
+class ProjectionMode(StrEnum):
+    """How an uploaded projection is combined with the one already on the board.
+
+    Three rather than a trust slider, because each answers a different question a
+    user actually has, and a number between 0 and 1 answers none of them clearly.
+    """
+
+    REPLACE = "replace"        # your number wins wherever you supplied one
+    BLEND = "blend"            # average yours with the board's, 50/50
+    FILL_GAPS = "fill_gaps"    # only where the board has no real projection
+
+
 class RecommendationLens(StrEnum):
     """Perspectives offered by the recommendation engine."""
 

@@ -30,9 +30,17 @@ from dataclasses import replace
 import pandas as pd
 import streamlit as st
 
+from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules
 from core.constants import HISTORICAL_IMPORT_COLUMNS, PLAYER_IMPORT_COLUMNS
-from core.enums import DraftType, LeagueFormat, Platform, ScoringPreset, Slot
+from core.enums import (
+    DraftType,
+    LeagueFormat,
+    Platform,
+    ProjectionMode,
+    ScoringPreset,
+    Slot,
+)
 from core.validation import ValidationReport
 from engine.draft_order import round_slot_order, validate_custom_order
 from models.database import session_scope
@@ -40,7 +48,12 @@ from models.league import League
 from models.manager import Manager
 from services.adapters import platform_hint, read_pasted_text, read_tabular
 from services.draft_paste import LAYOUT_LABELS, parse_draft_board
-from services.importers import import_historical_drafts, import_player_pool
+from services.importers import (
+    import_historical_drafts,
+    import_player_pool,
+    import_projections,
+    projection_template,
+)
 from services.live import build_live_board, current_season, quick_league
 from services.providers.base import cache_entries, clear_cache
 from services.providers.leagues import (
@@ -229,6 +242,25 @@ def _order_fits(order: dict[int, list[int]], team_count: int, rounds: int) -> bo
         set(slots) == expected and len(slots) == team_count
         for slots in order.values()
     )
+
+
+# Wording for the projection-upload modes. Phrased as what happens to *your* numbers
+# rather than by mode name, because "replace" and "blend" describe the code and the
+# question a user is actually asking is "what happens to the projections I just typed".
+_PROJECTION_MODE_LABELS: dict[str, ProjectionMode] = {
+    "Use mine": ProjectionMode.REPLACE,
+    "Average the two": ProjectionMode.BLEND,
+    "Only fill the gaps": ProjectionMode.FILL_GAPS,
+}
+_PROJECTION_MODE_HELP: dict[str, str] = {
+    "Use mine": "Your number wins for every player your file covers.",
+    "Average the two": "Halfway between yours and the board's — a hedge when you trust "
+                       "both. Stat lines are averaged stat by stat, so the projection "
+                       "still adds up to something explainable.",
+    "Only fill the gaps": "Your file is used only where the board has no real "
+                          "projection, which is normally the late rounds. Nothing "
+                          "already projected is touched.",
+}
 
 
 def _show_rejected(result, *, label: str) -> None:
@@ -970,6 +1002,158 @@ with players_tab:
             width="stretch", hide_index=True,
         )
         st.caption("First 25 rows. The full board is on the **Player Pool** page.")
+
+    # ── Your own projections ────────────────────────────────────────────────
+    # Below the pool rather than beside it, because this route *edits* the loaded
+    # board instead of replacing it: there has to be a board first.
+    st.divider()
+    st.markdown("**Use your own projections**")
+    if pool is None:
+        st.caption(
+            "Load a player pool first — your projections are applied to the players "
+            "already on the board, so there has to be a board to apply them to."
+        )
+    else:
+        st.caption(
+            "Your own numbers, or anyone's you trust more than the defaults. Supply "
+            "stat columns and they are scored under your league's rules by the same "
+            "arithmetic that scores every other projection here — which also means a "
+            "later scoring change updates them. Supply a points column instead and it "
+            "is taken exactly as given."
+        )
+
+        with st.expander("What columns to use"):
+            st.markdown(
+                "A **player name** column, and then either shape:\n\n"
+                "* **Stats** — the better option. Anything below, under any reasonable "
+                "spelling: `Rec Yds`, `rec_yards` and `receiving yards` all land in the "
+                "same place.\n"
+                "* **Points** — `projection`, `fpts`, `fantasy points`, `proj`. Works "
+                "with any export, but a points total does not say what rules produced "
+                "it, so it cannot be rescored when you change your scoring."
+            )
+            st.caption(
+                "A **position** column is optional but worth including: it is what "
+                "tells two players with the same name apart."
+            )
+            for group_label, group_fields in (
+                ("Passing", core_stats.PASSING_FIELDS),
+                ("Rushing", core_stats.RUSHING_FIELDS),
+                ("Receiving", core_stats.RECEIVING_FIELDS),
+                ("Other", core_stats.MISC_FIELDS),
+                ("Kicking", core_stats.KICKING_FIELDS),
+                ("Defence", core_stats.DST_FIELDS),
+            ):
+                st.markdown(f"*{group_label}* — `{'`, `'.join(group_fields)}`")
+            st.caption(
+                "Attempts, targets and games played are read and shown but score "
+                "nothing on their own — yardage, touchdowns and receptions are what a "
+                "projection is built from."
+            )
+            components.download_frame(
+                projection_template(), "Download a projections template",
+                "projections_template.csv",
+            )
+
+        mode_label = st.radio(
+            "Where the board already has a projection",
+            list(_PROJECTION_MODE_LABELS),
+            key="projections_mode",
+            horizontal=True,
+            help=(
+                "A projection this app estimated from draft position does not count as "
+                "one already being there — those are always replaced."
+            ),
+        )
+        st.caption(_PROJECTION_MODE_HELP[mode_label])
+
+        proj_upload_column, proj_paste_column = st.columns(2)
+        with proj_upload_column:
+            projections_file = st.file_uploader(
+                "Upload CSV / TSV / Excel",
+                type=["csv", "tsv", "txt", "xlsx", "xlsm", "xls"],
+                key="projections_upload",
+            )
+        with proj_paste_column:
+            projections_text = st.text_area(
+                "…or paste a table", height=150, key="projections_paste",
+                placeholder="player,pos,rush_yds,rush_td,rec,rec_yds,rec_td\n"
+                            "Joe Example,RB,1180,9,56,480,3",
+            )
+
+        if st.button("Apply my projections", key="apply_projections"):
+            proj_frame = None
+            proj_source = ""
+            if projections_file is not None:
+                proj_frame, proj_report = read_tabular(
+                    projections_file, file_name=projections_file.name
+                )
+                proj_source = projections_file.name
+                _report_messages(proj_report, context="Reading the file")
+            elif projections_text.strip():
+                proj_frame, proj_report = read_pasted_text(projections_text)
+                proj_source = "your pasted projections"
+                _report_messages(proj_report, context="Reading the pasted table")
+            else:
+                st.warning("Upload a file or paste a table first.")
+
+            if proj_frame is not None and not proj_frame.empty:
+                league = state.league()
+                scoring = league.config.scoring if league else ScoringRules()
+                result = import_projections(
+                    proj_frame,
+                    pool=pool,
+                    scoring=scoring,
+                    mode=_PROJECTION_MODE_LABELS[mode_label],
+                    source=proj_source or "your uploaded projections",
+                )
+                _report_messages(result.report, context="Applying your projections")
+                if result.outcome is not None and result.outcome.applied:
+                    outcome = result.outcome
+                    # Mutated in place, so this re-set exists for its side effects:
+                    # it drops cached recommendations and the in-progress draft, both
+                    # of which were computed from the projections that just changed.
+                    if "your projections" not in pool.metadata.source:
+                        pool.metadata.source = f"{pool.metadata.source} + your projections"
+                    state.set_pool(pool, source=pool.metadata.source)
+                    state.mark_sample_data(False)
+                    st.success(
+                        f"Applied your projections to {outcome.applied} player(s). "
+                        + outcome.describe()
+                    )
+                    if outcome.partial_merge:
+                        st.caption(
+                            f"{outcome.partial_merge} of them are now a mix: stats your "
+                            "file did not mention were kept from the projection that was "
+                            "already there, rather than being treated as zero."
+                        )
+                    if outcome.from_points:
+                        st.caption(
+                            f"{outcome.from_points} came from a points column with no "
+                            "stats behind it. Those are frozen at your current scoring "
+                            "rules — change your scoring and they will not move, while "
+                            "every projection built from stats will."
+                        )
+                    if outcome.rescore and outcome.rescore.unscorable_rules:
+                        st.caption(
+                            "Not applied, because a season total cannot say how many "
+                            "individual games cleared a threshold: "
+                            + ", ".join(outcome.rescore.unscorable_rules) + "."
+                        )
+                    st.dataframe(
+                        result.preview(), width="stretch", hide_index=True,
+                    )
+                    st.caption(
+                        f"What was read, first {min(25, result.accepted_rows)} of "
+                        f"{result.accepted_rows} row(s). Check a name or two before "
+                        "trusting the board."
+                    )
+                elif result.outcome is not None:
+                    # Rows were read and none were used — in "only fill the gaps" mode
+                    # that is the expected answer, so it is stated rather than left as
+                    # a page that looks like the button did nothing.
+                    st.info(f"Nothing changed. {result.outcome.describe()}")
+                _show_rejected(result, label="projection")
 
 # -- Draft history ----------------------------------------------------------
 with history_tab:
