@@ -691,16 +691,75 @@ def test_connecting_without_a_league_id_is_a_warning_not_a_fetch() -> None:
     app.button(key="connect_sleeper").click().run()
     _assert_clean(app)
     warnings = " ".join(str(block.value) for block in app.warning).lower()
-    assert "sleeper league id" in warnings
+    assert "sleeper league link" in warnings
+
+
+def test_connecting_espn_without_a_link_is_a_warning_not_a_fetch() -> None:
+    app = _app().run()
+    app.button(key="connect_espn").click().run()
+    _assert_clean(app)
+    warnings = " ".join(str(block.value) for block in app.warning).lower()
+    assert "espn league link" in warnings
+
+
+def test_both_connect_fields_accept_a_pasted_url() -> None:
+    """The whole point of the field: paste the address bar, not a hand-copied number.
+
+    Asserted at the page rather than only at the parser because the page is where the
+    two meet — a field that still demanded a bare ID would parse fine in isolation.
+    """
+    from services.providers.leagues import (
+        espn_league_reference,
+        sleeper_league_reference,
+    )
+
+    app = _app().run()
+    _assert_clean(app)
+    sleeper_help = str(app.text_input(key="sleeper_league_id").help).lower()
+    espn_help = str(app.text_input(key="espn_league_ref").help).lower()
+    assert "url" in str(app.text_input(key="sleeper_league_id").label).lower()
+    assert "url" in str(app.text_input(key="espn_league_ref").label).lower()
+    assert "id" in sleeper_help and "id" in espn_help
+
+    assert sleeper_league_reference(
+        "https://sleeper.com/leagues/1048291234567890123/team"
+    ) == "1048291234567890123"
+    assert espn_league_reference(
+        "https://fantasy.espn.com/football/league?leagueId=123456"
+    ) == ("123456", None)
+
+
+def test_the_espn_cookie_fields_are_masked_and_never_persisted() -> None:
+    """The two credential fields, and the promise made about them.
+
+    ``type="password"`` is the assertion that matters: these are the user's live ESPN
+    session, and an unmasked field puts them on screen for anyone looking. The second
+    half checks the page says what it does with them, because a user handing over a
+    session token deserves to be told, in the place they hand it over.
+    """
+    from streamlit.proto.TextInput_pb2 import TextInput as TextInputProto
+
+    app = _app().run()
+    _assert_clean(app)
+    # Read off the proto, not the AppTest wrapper: the wrapper's ``.type`` is the
+    # element kind ("text_input") for every field, masked or not, so asserting on it
+    # would pass whatever the page did.
+    for key in ("espn_s2", "espn_swid"):
+        field_type = app.text_input(key=key).proto.type
+        assert field_type == TextInputProto.Type.PASSWORD, (key, field_type)
+
+    text = _text(app).lower()
+    assert "never written to the database" in text
+    assert "never written to a log" in text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pasting a draft board — the ESPN/Yahoo route that replaces the false promise
+# Pasting a draft board — the route that works for every platform
 # ─────────────────────────────────────────────────────────────────────────────
-# The complaint these answer: "not sure how league sync works for ESPN and Yahoo".
-# The honest answer is that it does not, and the page now says so and offers the
-# route that does work. What follows pins both halves — the copy no longer promises
-# a connect that does not exist, and the paste route really does seat history.
+# ESPN and Sleeper now connect directly; Yahoo, NFL.com and CBS do not, and an ESPN
+# connect can fail on an endpoint nobody publishes. So the paste importer is not a
+# consolation prize, it is the floor under all of it, and these tests pin that it
+# still works and is still named on the page.
 ESPN_RECAP = """ROUND 1
 1. Team Alpha — Ja'Marr Chase, WR CIN
 2. Beta Ballers — Bijan Robinson, RB ATL
@@ -726,25 +785,94 @@ def _paste_app(text: str, *, league=None) -> AppTest:
     return app
 
 
-def test_the_page_no_longer_promises_an_espn_league_id_connect() -> None:
-    """The specific false claim, asserted against the rendered page.
+def test_the_espn_connect_seats_the_league_and_its_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wiring, end to end: what the importer returns is what the app then has.
 
-    It used to say a public ESPN league "imports with just its league ID". Nothing
-    implemented that, so a user following it went looking for a field that does not
-    exist and concluded the app was broken.
+    The importer itself is stubbed — its parsing is tested against ESPN-shaped payloads
+    in ``test_live_providers`` — because what can break *here* is different: the page
+    setting the league but not the history, or not clearing the sample-data flag, or not
+    passing the cookies through. Each of those leaves the app looking fine and behaving
+    wrongly.
+    """
+    from core.config import LeagueConfig
+    from models.draft import DraftHistory, HistoricalDraft, HistoricalPick
+    from models.league import League
+    from models.manager import Manager
+    from services.providers import leagues as leagues_module
+    from services.providers.leagues import LeagueImportResult
+
+    managers = [
+        Manager(name=f"espn-manager-{slot}", draft_slot=slot, is_user=slot == 3)
+        for slot in range(1, 5)
+    ]
+    history = DraftHistory()
+    draft = HistoricalDraft(season=2025, league_name="Imported", platform="espn")
+    draft.picks.append(
+        HistoricalPick(
+            season=2025, manager_name="espn-manager-1", overall_pick=1,
+            player_name="Ja'Marr Chase", league_name="Imported", platform="espn",
+        )
+    )
+    history.add(draft)
+
+    seen: dict[str, object] = {}
+
+    def _stub(ref, **kwargs):
+        seen.update(kwargs)
+        seen["ref"] = ref
+        return LeagueImportResult(
+            league=League(
+                config=LeagueConfig(name="Imported", team_count=4, user_draft_slot=3),
+                managers=managers,
+            ),
+            history=history,
+            source="ESPN league 123456 (2026)",
+        )
+
+    monkeypatch.setattr(leagues_module, "fetch_espn_league", _stub)
+
+    app = _app().run()
+    app.text_input(key="espn_league_ref").set_value(
+        "https://fantasy.espn.com/football/league?leagueId=123456"
+    ).run()
+    app.text_input(key="espn_s2").set_value("cookie-value").run()
+    app.text_input(key="espn_swid").set_value("{GUID-3}").run()
+    app.button(key="connect_espn").click().run()
+    _assert_clean(app)
+
+    # The cookies reached the importer, which is the only place they are allowed to go.
+    assert seen["espn_s2"] == "cookie-value"
+    assert seen["swid"] == "{GUID-3}"
+    assert "leagueId=123456" in str(seen["ref"])
+
+    from ui import state as ui_state
+
+    seated = app.session_state[ui_state.K_LEAGUE]
+    assert [m.name for m in seated.managers] == [m.name for m in managers]
+    assert len(app.session_state[ui_state.K_HISTORY].all_picks) == 1
+    assert app.session_state[ui_state.K_IS_SAMPLE] is False
+
+
+def test_the_espn_connect_exists_and_still_names_the_paste_fallback() -> None:
+    """Both halves of the ESPN story, on one page.
+
+    This test used to assert the opposite — that there was no ESPN league field, because
+    the copy promised a connect nothing implemented. There is one now, so the assertion
+    is inverted. What has not changed is the second half: ESPN's league API is
+    undocumented, so the page has to keep naming the paste importer as the route that
+    works when it breaks. Losing that on the way to shipping the connect is the
+    regression worth catching.
     """
     app = _app().run()
     _assert_clean(app)
+    labels = {str(getattr(box, "label", "")).lower() for box in app.text_input}
+    assert any("espn" in label and "league" in label for label in labels), labels
+
     text = _text(app).lower()
-    assert "imports with just its league id" not in text
-    # And there is no ESPN league-ID input to type into.
-    keys = {
-        str(getattr(box, "label", "")).lower()
-        for box in app.text_input
-    }
-    assert not any("espn" in key and "league" in key for key in keys), keys
-    # What replaced it is named on the page.
     assert "paste" in text and "recap" in text
+    assert "draft history" in text
 
 
 def test_pasting_a_recap_shows_what_it_read_before_importing_anything() -> None:

@@ -58,7 +58,9 @@ from services.importers import (
 from services.live import build_live_board, current_season, quick_league
 from services.providers.base import cache_entries, clear_cache
 from services.providers.leagues import (
+    LeagueImportResult,
     espn_league_instructions,
+    fetch_espn_league,
     fetch_sleeper_league,
     yahoo_league_instructions,
 )
@@ -93,6 +95,41 @@ def _report_messages(report: ValidationReport, *, context: str) -> None:
         st.warning(f"{context}: {issue.message}")
     for issue in report.infos:
         st.caption(f"{context}: {issue.message}")
+
+
+def _adopt_connected_league(connected: LeagueImportResult) -> bool:
+    """Put a freshly imported league into session state, and say so.
+
+    Shared by every connect route rather than written once per platform: adopting a
+    league is five separate pieces of state, and the bug where one route sets four of
+    them is invisible until a later page reads the fifth. Returns whether it happened,
+    so the caller can rerun.
+    """
+    if not connected.ok or connected.league is None:
+        return False
+    state.set_league(connected.league, source=connected.source)
+    if connected.history.drafts:
+        state.set_history(connected.history, source=connected.source)
+    pool = state.pool()
+    if pool is not None:
+        # Scoring drives projections and value-over-replacement, so the board has to be
+        # recomputed against the real league's rules.
+        pool.apply_league(connected.league.config)
+        state.set_pool(pool, source=pool.metadata.source)
+    state.mark_sample_data(False)
+    names = ", ".join(m.name for m in connected.league.managers[:4])
+    components.flash(
+        f"Connected **{connected.league.config.name}** — "
+        f"{len(connected.league.managers)} real managers ({names}…) and "
+        f"{len(connected.history.all_picks)} historical picks across "
+        f"{len(connected.history.drafts)} draft(s). "
+        + (
+            "Next: build the profiles on **Manager Profiles**."
+            if connected.history.drafts
+            else "With no past drafts, opponents use archetype priors."
+        )
+    )
+    return True
 
 
 def _manager_label(name: str, *, slot: int, is_user: bool) -> str:
@@ -464,21 +501,22 @@ connect_tab, league_tab, players_tab, history_tab, saved_tab = st.tabs(
 
 # -- Connect a league --------------------------------------------------------
 with connect_tab:
-    st.markdown("**Sleeper** — needs only your league ID, no login")
     st.caption(
-        "This pulls your real managers, your league's scoring and roster settings, "
-        "and every completed draft Sleeper has for the league — walking back through "
-        "past seasons automatically. Past drafts are what let the model learn each "
-        "manager's actual habits instead of assuming an average one."
+        "Paste a link. Everything on the **League settings** tab — teams, managers, "
+        "scoring, roster slots — is filled in for you, along with every past draft the "
+        "platform still has. Those past drafts are what let the model learn each "
+        "manager's real habits instead of assuming an average one."
     )
+
+    st.markdown("**Sleeper** — paste your league link, no login")
     sleeper_row = st.columns([2, 1])
     with sleeper_row[0]:
         sleeper_id = st.text_input(
-            "Sleeper league ID",
-            placeholder="1048291234567890123",
+            "Sleeper league URL or ID",
+            placeholder="https://sleeper.com/leagues/1048291234567890123/team",
             help=(
-                "The long number in your league's URL: "
-                "sleeper.com/leagues/**1048291234567890123**/team"
+                "Copy the address bar from any page of your league. The bare ID — the "
+                "long number in it — works too."
             ),
             key="sleeper_league_id",
         )
@@ -489,50 +527,91 @@ with connect_tab:
 
     if st.button("Connect Sleeper league", key="connect_sleeper", type="primary"):
         if not sleeper_id.strip():
-            st.warning("Enter your Sleeper league ID first.")
+            st.warning("Paste your Sleeper league link first.")
         else:
             with st.spinner("Reading your league from Sleeper…"):
                 connected = fetch_sleeper_league(
                     sleeper_id.strip(), include_history=bool(include_history)
                 )
             _report_messages(connected.report, context="Sleeper league")
-            if connected.ok:
-                state.set_league(connected.league, source=connected.source)
-                if connected.history.drafts:
-                    state.set_history(connected.history, source=connected.source)
-                pool = state.pool()
-                if pool is not None:
-                    # Scoring drives projections and value-over-replacement, so the
-                    # board has to be recomputed against the real league's rules.
-                    pool.apply_league(connected.league.config)
-                    state.set_pool(pool, source=pool.metadata.source)
-                state.mark_sample_data(False)
-                names = ", ".join(m.name for m in connected.league.managers[:4])
-                components.flash(
-                    f"Connected **{connected.league.config.name}** — "
-                    f"{len(connected.league.managers)} real managers ({names}…) and "
-                    f"{len(connected.history.all_picks)} historical picks across "
-                    f"{len(connected.history.drafts)} draft(s). "
-                    + (
-                        "Next: build the profiles on **Manager Profiles**."
-                        if connected.history.drafts
-                        else "With no past drafts, opponents use archetype priors."
-                    )
-                )
+            if _adopt_connected_league(connected):
                 st.rerun()
 
     st.divider()
-    st.markdown("**ESPN, Yahoo, NFL.com, CBS** — paste your draft recap, no login")
-    st.caption(
-        "None of these can be connected without either browser cookies or an OAuth "
-        "application, so none of them are. What replaces it works on all of them and "
-        "needs nothing installed: copy your draft recap and paste it on the **Draft "
-        "history** tab. That gives the opponent model the same picks a connection "
-        "would — who took whom, in what order. Fill in the league's settings on "
-        "**League settings**; there are only a handful."
-    )
-    with st.expander("Why ESPN is not a one-click connect"):
+    st.markdown("**ESPN** — paste your league link; no login for a public league")
+    espn_row = st.columns([2, 1, 1])
+    with espn_row[0]:
+        espn_ref = st.text_input(
+            "ESPN league URL or ID",
+            placeholder="https://fantasy.espn.com/football/league?leagueId=123456",
+            help=(
+                "Copy the address bar from your league's page. The league ID on its own "
+                "works too — it is the number after `leagueId=`."
+            ),
+            key="espn_league_ref",
+        )
+    with espn_row[1]:
+        espn_season = st.number_input(
+            "Season", min_value=2000, max_value=2100, value=int(current_season()),
+            key="espn_season",
+            help="If ESPN has no league that season, the season before is tried.",
+        )
+    with espn_row[2]:
+        espn_history = st.checkbox(
+            "Also import past drafts", value=True, key="espn_history",
+        )
+
+    # Collapsed, because most leagues do not need it and an open pair of credential
+    # fields reads as a login wall on a tool that does not have one.
+    with st.expander("My league is private (two cookies, not a password)"):
+        st.caption(
+            "ESPN refuses to answer for a private league unless the request carries your "
+            "session. These two values **are** that session, so treat them like a "
+            "password — but note that they are not one, and this app never asks for your "
+            "ESPN login. They are sent to ESPN and nowhere else: never written to the "
+            "database, never written to a log, never shown back to you, and gone when you "
+            "reload this page. Where to find them is in *How the ESPN connect works* below."
+        )
+        cookie_row = st.columns(2)
+        # type="password" on both: these are credentials and are masked on screen. Not
+        # persisted anywhere either — no repository call reads these keys.
+        espn_s2 = cookie_row[0].text_input(
+            "espn_s2", type="password", key="espn_s2",
+            help="A long string of letters, numbers, %-escapes and dots.",
+        )
+        espn_swid = cookie_row[1].text_input(
+            "SWID", type="password", key="espn_swid",
+            help="A GUID. The curly braces around it are optional here.",
+        )
+
+    if st.button("Connect ESPN league", key="connect_espn", type="primary"):
+        if not espn_ref.strip():
+            st.warning("Paste your ESPN league link first.")
+        else:
+            with st.spinner("Reading your league from ESPN…"):
+                connected = fetch_espn_league(
+                    espn_ref.strip(),
+                    season=int(espn_season),
+                    include_history=bool(espn_history),
+                    espn_s2=espn_s2,
+                    swid=espn_swid,
+                )
+            _report_messages(connected.report, context="ESPN league")
+            if _adopt_connected_league(connected):
+                st.rerun()
+
+    with st.expander("How the ESPN connect works, and what to do if it breaks"):
         st.markdown(espn_league_instructions())
+
+    st.divider()
+    st.markdown("**Yahoo, NFL.com, CBS** — paste your draft recap, no login")
+    st.caption(
+        "None of these publishes a league without an OAuth application, so none of them "
+        "are connected. What replaces it works on all three and needs nothing installed: "
+        "copy your draft recap and paste it on the **Draft history** tab. That gives the "
+        "opponent model the same picks a connection would — who took whom, in what order. "
+        "Fill in the league's settings on **League settings**; there are only a handful."
+    )
     with st.expander("Why Yahoo is not a one-click connect"):
         st.markdown(yahoo_league_instructions())
 

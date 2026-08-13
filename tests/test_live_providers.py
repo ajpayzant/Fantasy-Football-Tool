@@ -758,3 +758,363 @@ def test_a_player_no_adp_source_knows_is_dropped_not_ranked_last() -> None:
     assert resolved.player_count == 1
     assert resolved.frame["player_name"].iloc[0] == "Drafted Back"
     assert "dropped_unranked" in {issue.code for issue in resolved.report.issues}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ESPN league import
+# ─────────────────────────────────────────────────────────────────────────────
+# There is no recorded payload for this one, and there cannot be a checked-in real
+# one: an ESPN league payload is somebody's actual league, names and all. So these run
+# against a payload built to ESPN's shape-by-observation — the numeric lineup slot
+# ids, the scoringItems list, pickOrder, and draftDetail.picks carrying a playerId and
+# nothing else — and assert two things. First, that a league comes across whole.
+# Second, and more important for an endpoint nobody publishes, that every way it can
+# fail comes back as a message naming the paste importer rather than as an exception.
+ESPN_LINEUP_COUNTS = {
+    "0": 1, "2": 2, "4": 2, "6": 1, "23": 1, "16": 1, "17": 1, "20": 6,
+    "21": 1,   # IR — a seat no pick is spent on
+    "10": 2,   # LB — individual defence, which this app does not model
+}
+
+ESPN_SCORING_ITEMS = [
+    {"statId": 3, "points": 0.04},                                  # 1 pt / 25 pass yds
+    {"statId": 4, "points": 6.0},                                   # 6-point passing TD
+    {"statId": 20, "points": -2.0},
+    {"statId": 24, "points": 0.1},
+    {"statId": 25, "points": 6.0},
+    {"statId": 42, "points": 0.1},
+    {"statId": 43, "points": 6.0},
+    {"statId": 53, "points": 1.0, "pointsOverrides": {"4": 1.5}},   # PPR, TE premium
+    {"statId": 72, "points": -2.0},
+]
+
+
+def _espn_league_payload(season: int, *, teams: int = 4, drafted: bool = True) -> dict:
+    """One season of an ESPN league, shaped the way ESPN shapes it."""
+    return {
+        "id": 123456,
+        "seasonId": season,
+        "status": {"previousSeasons": [season - 1, season - 2]},
+        "settings": {
+            "name": "The Gauntlet",
+            "size": teams,
+            # Deliberately not 1,2,3,4: a seating bug that happens to be the identity
+            # map is invisible against an already-sorted pick order.
+            "draftSettings": {"type": "SNAKE", "pickOrder": [3, 1, 4, 2][:teams]},
+            "rosterSettings": {"lineupSlotCounts": ESPN_LINEUP_COUNTS},
+            "scoringSettings": {
+                "playerRankType": "PPR", "scoringItems": ESPN_SCORING_ITEMS,
+            },
+        },
+        "teams": [
+            {
+                "id": i, "location": "Team", "nickname": str(i),
+                "owners": [f"{{GUID-{i}}}"], "primaryOwner": f"{{GUID-{i}}}",
+            }
+            for i in range(1, teams + 1)
+        ],
+        "members": [
+            {"id": f"{{GUID-{i}}}", "displayName": f"manager{i}"}
+            for i in range(1, teams + 1)
+        ],
+        "draftDetail": {
+            "drafted": drafted,
+            "picks": [
+                {
+                    "playerId": 1000 + i, "teamId": (i % teams) + 1,
+                    "roundId": (i // teams) + 1, "roundPickNumber": (i % teams) + 1,
+                    "overallPickNumber": i + 1, "keeper": False,
+                }
+                for i in range(teams * 3)
+            ],
+        },
+    }
+
+
+def _espn_transport(
+    *,
+    seasons: tuple[int, ...] = (2026,),
+    fail: str = "",
+    missing: str = "HTTP 404 Not Found",
+):
+    """A stand-in for ``leagues._espn_get``, at the request boundary.
+
+    Patched here rather than at ``fetch_bytes`` so the ESPN-specific URL and header
+    construction runs too — including the ``x-fantasy-filter`` carrying the player-id
+    list, which is the part with no second chance if it is wrong.
+    """
+    calls: list[tuple[str, str, dict]] = []
+
+    def _get(path, *, params, cache_key, ttl=0, headers=None):
+        calls.append((path, params, dict(headers or {})))
+        if fail and "/players" not in path:
+            return None, fail
+        if "/players" in path:
+            ids = json.loads(headers["x-fantasy-filter"])["filterIds"]["value"]
+            return [
+                {
+                    "id": pid, "fullName": f"Player {pid}",
+                    "defaultPositionId": (pid % 4) + 1, "proTeamId": 1,
+                }
+                for pid in ids
+            ], ""
+        if path.startswith("leagueHistory"):
+            year = int(params.split("seasonId=")[1].split("&")[0])
+            return [_espn_league_payload(year)], ""
+        year = int(path.split("seasons/")[1].split("/")[0])
+        if year not in seasons:
+            return None, missing
+        return _espn_league_payload(year), ""
+
+    _get.calls = calls
+    return _get
+
+
+@pytest.fixture
+def espn_leagues(monkeypatch: pytest.MonkeyPatch):
+    """The league importer with its transport replaced, and a hook to configure it."""
+    from services.providers import leagues as leagues_module
+
+    def _with(**kwargs):
+        transport = _espn_transport(**kwargs)
+        monkeypatch.setattr(leagues_module, "_espn_get", transport)
+        return leagues_module, transport
+
+    return _with
+
+
+def test_a_public_espn_league_imports_whole_from_its_url(espn_leagues) -> None:
+    """The claim the Connect tab makes: paste a link, get a league you can draft."""
+    leagues_module, _ = espn_leagues()
+    result = leagues_module.fetch_espn_league(
+        "https://fantasy.espn.com/football/league?leagueId=123456", season=2026
+    )
+    assert result.ok, [i.message for i in result.report.errors]
+    config = result.league.config
+    assert config.name == "The Gauntlet"
+    assert config.team_count == 4
+    assert config.season == 2026
+    assert str(config.platform) == "ESPN"
+    # Managers are people, not team names, and are seated in ESPN's own pick order.
+    assert [(m.draft_slot, m.name) for m in result.league.managers] == [
+        (1, "manager3"), (2, "manager1"), (3, "manager4"), (4, "manager2")
+    ]
+    assert [m.team_name for m in result.league.managers][0] == "Team 3"
+
+
+def test_espn_roster_slots_come_across_and_unmodelled_seats_are_reported(
+    espn_leagues,
+) -> None:
+    """Two failures that look identical to a user: a dropped seat and a silent one."""
+    from core.enums import Slot
+
+    leagues_module, _ = espn_leagues()
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, include_history=False
+    )
+    assert dict(result.league.config.roster.slots) == {
+        Slot.QB: 1, Slot.RB: 2, Slot.WR: 2, Slot.TE: 1, Slot.FLEX: 1,
+        Slot.DST: 1, Slot.K: 1, Slot.BENCH: 6,
+    }
+    # IR consumes no pick, so it is not a round. The two LB seats are not modelled at
+    # all, and the user is told which — rather than left three seats short in silence.
+    assert result.league.config.rounds == 15
+    warnings = {i.code: i.message for i in result.report.warnings}
+    assert "espn_unmapped_slots" in warnings
+    assert "LB" in warnings["espn_unmapped_slots"]
+    assert "IR" not in warnings["espn_unmapped_slots"]
+
+
+def test_espn_scoring_is_imported_as_values_not_guessed_from_a_preset(
+    espn_leagues,
+) -> None:
+    """The league's own numbers, because the ones that differ change the board.
+
+    Six-point passing touchdowns move quarterback value by about a round, and a preset
+    would have quietly used four.
+    """
+    from core.enums import ScoringPreset
+
+    leagues_module, _ = espn_leagues()
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, include_history=False
+    )
+    scoring = result.league.config.scoring
+    assert scoring.pass_td == 6.0
+    assert scoring.pass_yards_per_point == 25.0    # inverted from ESPN's 0.04 per yard
+    assert scoring.rush_yards_per_point == 10.0
+    assert scoring.reception == 1.0
+    assert scoring.te_premium_reception_bonus == 0.5
+    assert scoring.interception == -2.0
+    assert scoring.preset is ScoringPreset.TE_PREMIUM
+
+
+def test_espn_draft_picks_get_real_player_names(espn_leagues) -> None:
+    """ESPN's draft board is player *ids*; without the second lookup it is numbers."""
+    leagues_module, transport = espn_leagues()
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    picks = result.history.all_picks
+    assert picks, "no history imported"
+    assert all(pick.player_name.startswith("Player ") for pick in picks)
+    assert all(pick.manager_name.startswith("manager") for pick in picks)
+    # The current season plus the two ESPN says exist, all from the one league link.
+    assert result.seasons_found == (2024, 2025, 2026)
+    assert {pick.season for pick in picks} == {2024, 2025, 2026}
+    # Names came from each season's own player list, not from the current one — ids do
+    # not survive across seasons, so reusing 2026's would misname a 2024 pick.
+    assert {
+        path for path, _params, _headers in transport.calls if "/players" in path
+    } == {
+        "seasons/2024/players", "seasons/2025/players", "seasons/2026/players",
+    }
+
+
+def test_espn_cookies_go_to_the_request_and_nowhere_else(espn_leagues) -> None:
+    """The user's ESPN session is a credential, and this is where that is enforced.
+
+    It has to reach the request — a private league is unreadable otherwise — and it must
+    not reach the cache key, which becomes a filename on disk.
+    """
+    leagues_module, transport = espn_leagues()
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, espn_s2="secret-s2", swid="GUID-2",
+    )
+    assert result.ok
+    cookies = [headers.get("Cookie", "") for _p, _q, headers in transport.calls]
+    assert any("espn_s2=secret-s2" in cookie for cookie in cookies)
+    # SWID is braced on the way out even when the user pasted it bare.
+    assert any("SWID={GUID-2}" in cookie for cookie in cookies)
+    assert not any("secret-s2" in f"{path}?{params}" for path, params, _h in transport.calls)
+    # And with the cookie, the app knows which team is the user's without being told.
+    assert result.league.config.user_draft_slot == 4
+    assert [m.draft_slot for m in result.league.managers if m.is_user] == [4]
+
+
+def test_a_public_espn_league_does_not_guess_which_team_is_yours(espn_leagues) -> None:
+    """Slot 1 and a warning, rather than a confident wrong answer."""
+    leagues_module, _ = espn_leagues()
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, include_history=False
+    )
+    assert result.league.config.user_draft_slot == 1
+    assert "espn_user_slot" in {i.code for i in result.report.warnings}
+
+
+@pytest.mark.parametrize("missing", ["HTTP 404 Not Found", "HTTP 401 Unauthorized"])
+def test_a_league_not_rolled_over_yet_falls_back_a_season(
+    espn_leagues, missing: str
+) -> None:
+    """August, and the user's league still only exists in last year. Not a dead end.
+
+    Both statuses are covered because the live endpoint answers 401 for a league it has
+    no record of, not 404 — so retrying only on 404 would leave this case broken for
+    exactly the month people are drafting in.
+    """
+    leagues_module, _ = espn_leagues(seasons=(2025,), missing=missing)
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, include_history=False
+    )
+    assert result.ok
+    assert result.league.config.season == 2025
+    assert "espn_season_fallback" in {i.code for i in result.report.warnings}
+
+
+def test_bad_cookies_do_not_set_off_a_second_season_of_requests(espn_leagues) -> None:
+    """A 401 means something different once cookies are involved.
+
+    Without them it may be a league that has not rolled over. With them it is the
+    cookies, and the season has nothing to do with it — so retrying is a wasted round
+    trip and a misleading message about the season.
+    """
+    leagues_module, transport = espn_leagues(fail="HTTP 401 Unauthorized")
+    result = leagues_module.fetch_espn_league(
+        "123456", season=2026, espn_s2="stale", swid="GUID-1",
+    )
+    assert not result.ok
+    assert len(transport.calls) == 1
+    assert "expired" in " ".join(i.message for i in result.report.errors)
+
+
+@pytest.mark.parametrize(
+    "failure, expected",
+    [
+        # 401 is what the live endpoint returns for a private league *and* for one that
+        # does not exist, so its message has to name both possibilities.
+        ("HTTP 401 Unauthorized", "no such league"),
+        ("HTTP 404 Not Found", "no league"),
+        ("network error: simulated outage", "undocumented"),
+    ],
+)
+def test_every_espn_failure_is_a_message_naming_the_paste_importer(
+    espn_leagues, failure: str, expected: str
+) -> None:
+    """The constraint this whole feature is built under.
+
+    ESPN's league API is not a published interface and can move without notice, so no
+    failure of it may raise, and none may leave the user without a route. Each of the
+    three distinct failures says something different — "it didn't work" is not an
+    instruction — and all three name the importer that needs no connection at all.
+    """
+    leagues_module, _ = espn_leagues(fail=failure)
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    assert not result.ok
+    assert result.league is None
+    message = " ".join(i.message for i in result.report.errors).lower()
+    assert expected in message
+    assert "paste importer" in message and "draft history" in message
+
+
+def test_an_espn_league_that_is_not_a_league_is_refused_before_any_request(
+    espn_leagues,
+) -> None:
+    leagues_module, transport = espn_leagues()
+    result = leagues_module.fetch_espn_league("my league name")
+    assert not result.ok
+    assert transport.calls == []
+    assert "espn_league_id" in {i.code for i in result.report.errors}
+
+
+def test_an_espn_draft_with_no_resolvable_players_is_skipped_not_imported() -> None:
+    """Picks without names would enter a manager's profile as noise.
+
+    No transport is patched here, so the name lookup cannot succeed — which is exactly
+    the real case where ESPN drops player detail for an old season.
+    """
+    from services.providers import leagues as leagues_module
+
+    assert leagues_module._espn_parse_draft(
+        _espn_league_payload(2026), season=2026, league_name="X", current_names={},
+    ) is None
+
+
+def test_a_pasted_sleeper_url_reaches_the_same_league_as_the_bare_id() -> None:
+    """Nobody retypes a nineteen-digit id; the thing on the clipboard is the URL."""
+    from services.providers.leagues import sleeper_league_reference
+
+    assert sleeper_league_reference(
+        "https://sleeper.com/leagues/1048291234567890123/team"
+    ) == "1048291234567890123"
+    assert sleeper_league_reference("1048291234567890123") == "1048291234567890123"
+    assert sleeper_league_reference(
+        "sleeper.app/leagues/999888777666555/draft"
+    ) == "999888777666555"
+    # Ambiguity is refused rather than guessed at.
+    assert sleeper_league_reference("my league") == ""
+    assert sleeper_league_reference("") == ""
+
+
+def test_an_espn_url_yields_its_league_and_its_season() -> None:
+    """Every shape ESPN has put a league id into, including the legacy host."""
+    from services.providers.leagues import espn_league_reference
+
+    assert espn_league_reference(
+        "https://fantasy.espn.com/football/league?leagueId=123456"
+    ) == ("123456", None)
+    assert espn_league_reference(
+        "https://fantasy.espn.com/football/team?leagueId=98765&teamId=3&seasonId=2024"
+    ) == ("98765", 2024)
+    assert espn_league_reference(
+        "http://games.espn.com/ffl/leaguesetup/ownerinfo?leagueId=555&seasonId=2018"
+    ) == ("555", 2018)
+    assert espn_league_reference("123456") == ("123456", None)
+    assert espn_league_reference("my league") == ("", None)
