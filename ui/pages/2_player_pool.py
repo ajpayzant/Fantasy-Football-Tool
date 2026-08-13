@@ -25,6 +25,38 @@ league = state.league()
 frame = pool.to_frame()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Straight averages across the sources
+#
+# The `overall_adp` the engine uses is a *weighted* blend — sources are not trusted
+# equally, and the weights are editable on Settings. That is the right number to draft
+# against and the wrong number to answer "what do the platforms think on average",
+# because a user comparing columns cannot see the weights. So the plain unweighted mean
+# is computed here and shown beside the per-platform columns: if it disagrees with the
+# blend, the difference is the weighting, which is the one thing worth noticing.
+# ─────────────────────────────────────────────────────────────────────────────
+ADP_SOURCE_COLUMNS = ["ffc_adp", "espn_adp", "yahoo_adp"]
+RANK_SOURCE_COLUMNS = ["espn_rank", "yahoo_rank", "sleeper_rank"]
+
+
+def _row_mean(source_frame: pd.DataFrame, columns: list[str]) -> pd.Series:
+    """Mean of whichever of ``columns`` this row actually has.
+
+    ``skipna=True`` is the whole point: a player only Yahoo has gets Yahoo's number
+    rather than a mean dragged toward nothing, and the Sources count beside it says how
+    many opinions that average rests on.
+    """
+    present = [column for column in columns if column in source_frame.columns]
+    if not present:
+        return pd.Series(dtype=float, index=source_frame.index)
+    return source_frame[present].mean(axis=1, skipna=True)
+
+
+if not frame.empty:
+    frame["avg_source_adp"] = _row_mean(frame, ADP_SOURCE_COLUMNS).round(1)
+    frame["avg_source_rank"] = _row_mean(frame, RANK_SOURCE_COLUMNS).round(1)
+    frame["adp_vs_blend"] = (frame["avg_source_adp"] - frame["overall_adp"]).round(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Provenance — where these numbers came from
 # ─────────────────────────────────────────────────────────────────────────────
 metadata = pool.metadata
@@ -132,6 +164,97 @@ with st.expander("Where every number on this page comes from"):
         )
     if metadata.notes:
         st.caption(metadata.notes)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOR, explained
+#
+# Its own section rather than a tooltip, because VOR is the number most likely to be
+# quoted without being understood — and the honest version includes what it cannot do.
+# The replacement ranks are read out of the live league config, so the numbers here are
+# this league's, not a textbook's.
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("📐 What VOR is, where it comes from, and how much to trust it"):
+    st.markdown(
+        "**VOR = this player's projected points − the projected points of the last "
+        "player at his position anyone would start.**"
+    )
+    st.caption(
+        "That subtraction is the whole idea. Raw projected points cannot be compared "
+        "across positions: a quarterback out-scores every running back in almost any "
+        "format, and drafting on projection alone would have you take five of them. "
+        "What matters is not how many points a player scores but how many *more* he "
+        "scores than the player you would otherwise have had in that slot. VOR is that "
+        "difference, and it is why a tight end projected for 190 can be worth more than "
+        "a running back projected for 210."
+    )
+    st.markdown("**How it is computed here**")
+    if league is not None:
+        replacement_rows = []
+        for position in Position:
+            group = pool.by_position(position)
+            if not group:
+                continue
+            cutoff = int(round(league.config.replacement_rank(position)))
+            ranked = sorted(group, key=lambda p: -(p.projection or 0.0))
+            index = min(max(0, cutoff - 1), len(ranked) - 1)
+            replacement = ranked[index]
+            replacement_rows.append({
+                "Position": str(position),
+                "Replacement is": f"{position}{index + 1}",
+                "Who that is": replacement.name,
+                "Replacement points": (
+                    round(float(replacement.projection or 0.0), 1)
+                ),
+                "Players in pool": len(group),
+            })
+        st.caption(
+            "Within each position, players are sorted by projection and the "
+            f"replacement level is set at the rank your league's demand implies for "
+            f"{league.config.team_count} teams and this exact lineup "
+            f"({league.config.roster.starters_total} starters, "
+            f"{league.config.roster.bench_total} bench). Every player at that position "
+            "is then measured against that one player's projection:"
+        )
+        st.dataframe(
+            pd.DataFrame(replacement_rows), width="stretch", hide_index=True,
+        )
+        st.caption(
+            "This is why VOR moves when you change the lineup. Add a second starting "
+            "quarterback or a superflex and the QB replacement level drops much deeper "
+            "into the position, every quarterback's VOR jumps, and the model starts "
+            "taking them earlier — without anyone editing a ranking."
+        )
+    else:
+        st.caption(
+            "Needs a league to know how many starters each position demands, so VOR is "
+            "blank until one is set up on **Setup**."
+        )
+    st.markdown("**How useful it actually is**")
+    st.markdown(
+        "- **Good at**: comparing across positions, and telling you when a position is "
+        "genuinely scarce in *your* format rather than in general. It is the reason "
+        "this app will tell you a mid-tier tight end is a better pick than a better-"
+        "projected receiver.\n"
+        "- **Good at**: exposing the flat middle of a position. When twenty running "
+        "backs have VOR within ten points of each other, the position is a commodity "
+        "and reaching inside that block costs you nothing but flexibility.\n"
+        "- **Bad at**: anything that depends on *when* a player is available. VOR says "
+        "a player is worth 60 points more than replacement; it does not say he will "
+        "still be there in two rounds. That is what the survival simulation in the "
+        "**Draft Room** is for, and it is why VOR is one term in the pick model rather "
+        "than the model itself.\n"
+        "- **Bad at**: bench value and streaming. Replacement level assumes you start "
+        "the same lineup all year, so a handcuff running back or a bye-week fill-in "
+        "scores badly on VOR while being a perfectly sensible late pick.\n"
+        "- **Only as good as the projection behind it.** A projection this app derived "
+        "from draft position produces a VOR derived from draft position — circular, and "
+        "flagged as such in the `Projection from` column."
+    )
+    st.caption(
+        "Its weight in the model is `value_over_replacement` on **Settings**. Set it to "
+        "zero and the room drafts on raw points and ADP instead — a quick way to see how "
+        "much of any given recommendation is VOR's doing."
+    )
 
 st.divider()
 
@@ -251,7 +374,11 @@ sort_options = {
     "Risk (safest first)": ("risk_score", True),
     "Risk (riskiest first)": ("risk_score", False),
     "Source disagreement": ("adp_disagreement", False),
+    "Average ADP across sources": ("avg_source_adp", True),
+    "Average rank across sources": ("avg_source_rank", True),
+    "Consensus rank": ("overall_rank", True),
     "ESPN rank": ("espn_rank", True),
+    "Yahoo rank": ("yahoo_rank", True),
     "ESPN ADP": ("espn_adp", True),
     "Yahoo ADP": ("yahoo_adp", True),
     "Fantasy Football Calculator ADP": ("ffc_adp", True),
@@ -269,9 +396,10 @@ tiers = sorted({int(t) for t in frame["tier"].dropna().tolist()})
 tier_choice = sort_columns[2].multiselect("Tiers", tiers)
 column_set = sort_columns[3].radio(
     "Columns",
-    ["Value", "Every platform"],
-    help="Value shows the blended board. Every platform shows what each source "
-         "thinks, side by side, so you can see where they disagree.",
+    ["Value", "ADP by platform", "Ranks by platform"],
+    help="Value shows the blended board. The other two show each source's own number "
+         "side by side with the plain average, so you can see where the platforms "
+         "disagree and where the blend's weighting is doing the work.",
 )
 
 view = frame.copy()
@@ -347,8 +475,10 @@ display = view.head(int(row_limit)).rename(columns={
     "value_over_replacement": "VOR", "ceiling": "Ceiling", "floor": "Floor",
     "risk_score": "Risk", "is_rookie": "Rookie", "injury_status": "Injury",
     "ffc_adp": "FFC ADP", "espn_adp": "ESPN ADP", "espn_rank": "ESPN rank",
-    "yahoo_adp": "Yahoo ADP", "sleeper_rank": "Sleeper",
+    "yahoo_adp": "Yahoo ADP", "yahoo_rank": "Yahoo rank", "sleeper_rank": "Sleeper",
     "adp_source_count": "Sources", "adp_disagreement": "Disagreement",
+    "avg_source_adp": "Avg ADP", "avg_source_rank": "Avg rank",
+    "adp_vs_blend": "Avg − blend",
     "projection_source": "Projection from",
     "board_mark": "My list", "my_rank": "My rank",
 })
@@ -357,14 +487,42 @@ VALUE_COLUMNS = [
     "Player", "Pos", "Team", "Bye", "Tier", "ADP", "ADP σ", "Sources",
     "Proj", "VOR", "Ceiling", "Floor", "Risk", "Rookie", "Injury",
 ]
-PLATFORM_COLUMNS = [
-    "Player", "Pos", "Team", "Tier", "ADP", "Sources", "Disagreement",
-    "FFC ADP", "ESPN ADP", "ESPN rank", "Yahoo ADP", "Sleeper", "Proj", "VOR",
+ADP_PLATFORM_COLUMNS = [
+    "Player", "Pos", "Team", "Tier", "ADP", "Avg ADP", "Avg − blend",
+    "FFC ADP", "ESPN ADP", "Yahoo ADP", "Sources", "Disagreement", "ADP σ",
 ]
-wanted = VALUE_COLUMNS if column_set == "Value" else PLATFORM_COLUMNS
+RANK_PLATFORM_COLUMNS = [
+    "Player", "Pos", "Team", "Tier", "Rank", "Avg rank",
+    "ESPN rank", "Yahoo rank", "Sleeper", "PosRank", "PlatRank", "Proj", "VOR",
+]
+wanted = {
+    "Value": VALUE_COLUMNS,
+    "ADP by platform": ADP_PLATFORM_COLUMNS,
+    "Ranks by platform": RANK_PLATFORM_COLUMNS,
+}[column_set]
 if not board.is_empty:
     # Beside the name, where a marker is read rather than hunted for.
     wanted = [wanted[0], "My list", "My rank", *wanted[1:]]
+
+if column_set == "ADP by platform":
+    st.caption(
+        "**ADP is where a player actually goes; rank is where a site says he should "
+        "go.** They differ, and the gap is often the interesting part. `ADP` is the "
+        "weighted blend the engine drafts against, `Avg ADP` is the plain unweighted "
+        "mean of the columns to its right, and `Avg − blend` is the difference: "
+        "positive means the blend has him going *earlier* than a straight average "
+        "would, because it trusts the source that likes him more."
+    )
+elif column_set == "Ranks by platform":
+    st.caption(
+        "Rankings, not draft position — a site's stated opinion rather than what its "
+        "drafters do. `Rank` is the consensus ordering the engine uses, `Avg rank` is "
+        "the plain mean of the per-site columns, `PosRank` is rank within the position "
+        "and `PlatRank` is your league's own platform. A player whose rank is far "
+        "better than his ADP is one the sites like more than the drafters do, which is "
+        "exactly the kind of player who lasts a round longer than he should."
+    )
+
 st.dataframe(
     display[[c for c in wanted if c in display.columns]],
     width="stretch", hide_index=True, height=460,
@@ -399,6 +557,38 @@ st.dataframe(
             "Sources", format="%d",
             help="How many ADP sources had this player. A blended ADP from one source "
                  "is a single opinion, not a consensus.",
+        ),
+        "Avg ADP": st.column_config.NumberColumn(
+            "Avg ADP", format="%.1f",
+            help="Plain unweighted mean of the per-source ADP columns — every source "
+                 "that had him counted once. The `ADP` column is the *weighted* blend "
+                 "the engine actually drafts against.",
+        ),
+        "Avg − blend": st.column_config.NumberColumn(
+            "Avg − blend", format="%+.1f",
+            help="Average ADP minus the blended ADP. Near zero means the sources agree "
+                 "and the weighting is irrelevant. Large either way means the blend is "
+                 "leaning on one source, and it is worth looking at which.",
+        ),
+        "Avg rank": st.column_config.NumberColumn(
+            "Avg rank", format="%.1f",
+            help="Plain mean of the per-site rankings. Sleeper's number is popularity "
+                 "rather than a ranking, so it pulls this toward whoever is being "
+                 "searched for right now.",
+        ),
+        "Rank": st.column_config.NumberColumn(
+            "Rank", format="%.0f",
+            help="The consensus overall ranking the engine uses for ordering.",
+        ),
+        "PosRank": st.column_config.NumberColumn(
+            "PosRank", format="%d",
+            help="Rank within the position — RB7, WR14. Often more useful than overall "
+                 "rank, because you draft against a position's supply, not the pool's.",
+        ),
+        "PlatRank": st.column_config.NumberColumn(
+            "PlatRank", format="%.0f",
+            help="Your own league platform's ranking. The simulated managers estimated "
+                 "to follow their platform's list are pulled toward this one.",
         ),
         "Disagreement": st.column_config.NumberColumn(
             "Disagreement", format="%.0f",

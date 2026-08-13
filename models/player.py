@@ -1120,6 +1120,7 @@ class PlayerPool:
                 "espn_adp": player.espn_adp,
                 "espn_rank": player.espn_rank,
                 "yahoo_adp": player.yahoo_adp,
+                "yahoo_rank": player.yahoo_rank,
                 "sleeper_rank": player.sleeper_rank,
                 "adp_source_count": player.adp_source_count,
                 "adp_disagreement": player.adp_disagreement,
