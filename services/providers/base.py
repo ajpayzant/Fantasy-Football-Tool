@@ -32,11 +32,12 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 import pandas as pd
 
+from core import freshness
 from core.config import DEFAULT_PATHS
 from core.validation import ValidationReport
 
@@ -78,6 +79,20 @@ def _iso(moment: datetime) -> str:
     return moment.replace(microsecond=0).isoformat()
 
 
+def _retrieved_at(age_seconds: float | None) -> str:
+    """When a payload this old was actually retrieved.
+
+    Exists because ``fetched_at`` used to be stamped with the time of the *call* on
+    a cache hit, which made a board served from a three-day-old cache — what
+    happens automatically whenever a source is down — report itself as fetched
+    seconds ago. The one field the whole staleness warning rests on was the one
+    field guaranteed to say "now".
+    """
+    if age_seconds is None:
+        return _iso(_utc_now())
+    return _iso(_utc_now() - timedelta(seconds=max(0.0, float(age_seconds))))
+
+
 @dataclass(slots=True)
 class FetchOutcome:
     """The raw result of one HTTP fetch, successful or not."""
@@ -87,6 +102,14 @@ class FetchOutcome:
     from_cache: bool = False
     fetched_at: str = ""
     cache_age_seconds: float | None = None
+    stale_fallback: bool = False
+    """True when the network failed and an *expired* cache entry was served.
+
+    Distinguished from an ordinary cache hit because it is the one case where the
+    data is knowingly past its useful life and the user was never told: ``ok`` is
+    True, so every provider treats it as a success, and the only trace was an
+    ``error`` string nothing reads on the success path.
+    """
     error: str = ""
 
     @property
@@ -111,6 +134,7 @@ class ProviderResult:
     cache_age_seconds: float | None = None
     season: int | None = None
     scoring_format: str = ""
+    stale_fallback: bool = False
     report: ValidationReport = field(default_factory=ValidationReport)
     notes: str = ""
 
@@ -121,6 +145,17 @@ class ProviderResult:
     @property
     def row_count(self) -> int:
         return 0 if self.frame is None else int(len(self.frame))
+
+    @property
+    def age_hours(self) -> float | None:
+        """How old the *data* is, cache included. ``None`` when it cannot be told."""
+        if self.cache_age_seconds is not None:
+            return float(self.cache_age_seconds) / 3600.0
+        return freshness.age_hours(self.fetched_at)
+
+    def freshness(self) -> freshness.FreshnessVerdict:
+        """This source's age as the rest of the app judges age."""
+        return freshness.assess(self.fetched_at, season=self.season)
 
     def freshness_label(self) -> str:
         """A human sentence about how current this data is.
@@ -133,6 +168,14 @@ class ProviderResult:
         if not self.from_cache:
             return f"fetched live at {self.fetched_at}"
         age = self.cache_age_seconds or 0.0
+        if self.stale_fallback:
+            # Named separately from an ordinary cache hit: this one is past its TTL
+            # and was used only because the source could not be reached, which is a
+            # different thing from "we chose not to re-request it yet".
+            return (
+                f"expired cache, {age / 3600:.1f} hours old — the source could not "
+                "be reached"
+            )
         if age < 90 * 60:
             return f"cached {int(age / 60)} min ago"
         return f"cached {age / 3600:.1f} hours ago"
@@ -252,7 +295,7 @@ def fetch_bytes(
         if cached is not None:
             LOGGER.debug("Cache hit for %s (%.0fs old)", cache_key, age or 0)
             return FetchOutcome(
-                cached, url, from_cache=True, fetched_at=_iso(_utc_now()),
+                cached, url, from_cache=True, fetched_at=_retrieved_at(age),
                 cache_age_seconds=age,
             )
 
@@ -296,8 +339,9 @@ def fetch_bytes(
     if stale is not None:
         LOGGER.info("Serving stale cache for %s (%.1f hours old)", cache_key, (age or 0) / 3600)
         return FetchOutcome(
-            stale, url, from_cache=True, fetched_at=_iso(_utc_now()),
+            stale, url, from_cache=True, fetched_at=_retrieved_at(age),
             cache_age_seconds=age,
+            stale_fallback=True,
             error=f"{last_error} — served stale cached copy instead.",
         )
     return FetchOutcome(None, url, error=last_error)

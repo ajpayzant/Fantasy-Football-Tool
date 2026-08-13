@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from core import freshness
 from core.config import LeagueConfig, RosterSettings, ScoringRules
 from core.enums import Archetype, DraftType, LeagueFormat, Platform, ScoringPreset, Slot
 from core.validation import ValidationReport
@@ -110,6 +111,24 @@ class LiveBoardResult:
     @property
     def ok(self) -> bool:
         return self.pool is not None and len(self.pool) > 0
+
+    def freshness(self) -> freshness.FreshnessVerdict:
+        """How current this board is, judged as everything else judges age."""
+        return freshness.assess(
+            self.fetched_at, season=self.season, expected_season=self.season
+        )
+
+    def stale_sources(self) -> list[str]:
+        """Sources that answered from an expired cache because they were unreachable.
+
+        Named separately from failed sources: these contributed columns to the
+        board, so their age is on the board whether or not the fetch "worked".
+        """
+        return [
+            info.get("label", key)
+            for key, info in self.source_status.items()
+            if info.get("ok") and info.get("stale_fallback")
+        ]
 
     def summary(self) -> str:
         """One line naming what was loaded and from where."""
@@ -230,11 +249,16 @@ def build_live_board(
         )
         return result
 
-    fetched_at = ""
-    for candidate in (ffc, espn, yahoo, sleeper):
-        if candidate is not None and candidate.ok and candidate.fetched_at:
-            fetched_at = candidate.fetched_at
-            break
+    # The oldest contributing source, not the first one that answered. A board is as
+    # old as its stalest column: if FFC is live but ESPN came from a three-day-old
+    # cache, the ranks on this board are three days old and stamping it with FFC's
+    # timestamp would hide exactly the case worth reporting.
+    timestamps = [
+        candidate.fetched_at
+        for candidate in (ffc, espn, yahoo, sleeper)
+        if candidate is not None and candidate.ok and candidate.fetched_at
+    ]
+    fetched_at = min(timestamps) if timestamps else ""
     result.fetched_at = fetched_at
 
     import_result = import_player_pool(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
@@ -25,6 +26,7 @@ from core.constants import (
     PLAYER_REQUIRED_COLUMNS,
     SAMPLE_DATA_BANNER,
 )
+from core import freshness as core_freshness
 from core import stats as core_stats
 from core.config import ScoringRules
 from core.enums import InjuryStatus, Platform, Position, ProjectionMode
@@ -61,6 +63,11 @@ from services.normalize import (
 )
 
 LOGGER = logging.getLogger("fantasy_mock_draft.importers")
+
+
+def _iso_now() -> str:
+    """Now, to the second, in UTC — the format every timestamp in this app uses."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 @dataclass(slots=True)
@@ -537,7 +544,15 @@ def import_player_pool(
 
     metadata = PoolMetadata(
         source=source,
-        imported_at=imported_at,
+        # Stamped here when the caller did not supply one, so every pool can say how
+        # old it is. An upload's timestamp is flagged as the time of the *load*: a
+        # pool with no timestamp at all reads as "age unknown", which would fire the
+        # staleness warning on a file the user handed over five seconds ago and teach
+        # them to dismiss it.
+        imported_at=imported_at or _iso_now(),
+        timestamp_basis=(
+            core_freshness.FETCHED if imported_at else core_freshness.IMPORTED
+        ),
         season=season,
         platform=str(platform) if platform else None,
         player_count=len(players),

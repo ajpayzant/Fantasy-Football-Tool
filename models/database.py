@@ -304,6 +304,15 @@ class PlayerDataSourceRow(Base, TimestampMixin):
     """upload | sample | api | manual"""
     file_name = Column(String(255), default="")
     imported_at = Column(DateTime, default=utcnow, nullable=False)
+    """When the *data* was obtained — not when this row was written.
+
+    ``save_player_pool`` used to overwrite this with the time of the save, which made
+    a board fetched three days ago come back tomorrow claiming to be brand new. It is
+    now copied from the pool's own metadata, so a saved league reloads with the age it
+    actually has.
+    """
+    timestamp_basis = Column(String(20), default="fetched")
+    """Whether ``imported_at`` is when the data was fetched or merely loaded."""
     player_count = Column(Integer, default=0)
     is_sample_data = Column(Boolean, default=False)
     notes = Column(Text, default="")
@@ -698,6 +707,14 @@ _V2_PLAYER_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Added in schema v3. Existing rows default to "fetched", which is what they were
+# implicitly claiming before the column existed; no backfill is possible because the
+# distinction was never recorded.
+_V3_SOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("timestamp_basis", "VARCHAR(20)"),
+)
+
+
 def _migrate(session: Session, from_version: int, to_version: int) -> None:
     """Apply additive migrations between schema versions.
 
@@ -711,7 +728,13 @@ def _migrate(session: Session, from_version: int, to_version: int) -> None:
             for column, ddl_type in _V2_PLAYER_COLUMNS
         )
         LOGGER.info("Migration v2: added %s provenance column(s) to players", added)
-    if to_version <= 2:
+    if from_version < 3:
+        added = sum(
+            _add_column_if_missing(session, "player_data_sources", column, ddl_type)
+            for column, ddl_type in _V3_SOURCE_COLUMNS
+        )
+        LOGGER.info("Migration v3: added %s column(s) to player_data_sources", added)
+    if to_version <= 3:
         return
     LOGGER.debug("No migration steps defined for v%s → v%s", from_version, to_version)
 

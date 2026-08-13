@@ -14,6 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from core.enums import Archetype, Position, RiskBand
+from core.freshness import Freshness
 from models.player import Player, PlayerPool
 
 from . import state
@@ -50,11 +51,12 @@ def render_flashes() -> None:
 
 
 def page_header(title: str, subtitle: str = "") -> None:
-    """Title, optional subtitle, the sample-data banner, and any queued messages."""
+    """Title, optional subtitle, the data banners, and any queued messages."""
     st.title(title)
     if subtitle:
         st.caption(subtitle)
     sample_banner()
+    staleness_banner()
     render_flashes()
 
 
@@ -79,6 +81,33 @@ def sample_banner() -> None:
         "data. Fetch current data on **Setup** to replace it.",
         icon="⚠️",
     )
+
+
+def staleness_banner() -> None:
+    """Say so when the loaded board is old enough that it changes a decision.
+
+    On every page rather than only on Setup, for the same reason as
+    :func:`sample_banner`: the page where stale ADP does damage is the Draft Room,
+    and a user who left the app open overnight never returns to Setup to be told.
+
+    Deliberately quiet below the threshold. A warning on a six-hour-old board would
+    train the user to dismiss the one that matters, so :class:`Freshness` decides
+    what counts and only its concerning levels interrupt.
+    """
+    pool = state.pool()
+    if pool is None or pool.metadata.is_sample_data:
+        # Sample data has its own, louder banner, and stacking two warnings about
+        # the same pool buries both.
+        return
+    league = state.league()
+    verdict = pool.metadata.freshness(
+        expected_season=league.config.season if league is not None else None
+    )
+    if not verdict.is_concerning:
+        if verdict.level is Freshness.AGING:
+            st.caption(f"ℹ️ {verdict.headline()} {verdict.advice()}")
+        return
+    st.warning(f"{verdict.headline()} {verdict.advice()}", icon="🕒")
 
 
 def blocked(reason: str) -> None:
@@ -283,7 +312,7 @@ def download_frame(frame: pd.DataFrame, label: str, file_name: str) -> None:
 
 __all__ = [
     "POSITION_COLOURS", "RISK_ICONS", "flash", "render_flashes",
-    "page_header", "sample_banner", "blocked",
+    "page_header", "sample_banner", "staleness_banner", "blocked",
     "require", "sidebar_status", "position_badge", "player_line", "player_frame",
     "risk_label", "survival_bar", "position_bar_chart", "histogram",
     "archetype_caption", "metric_row", "download_frame",

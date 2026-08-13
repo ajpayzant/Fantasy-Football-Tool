@@ -8,6 +8,7 @@ from typing import Any, Iterable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
+from core import freshness as core_freshness
 from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules
 from core.constants import SLOT_ELIGIBILITY, SLOT_FILL_PRIORITY
@@ -360,6 +361,20 @@ class PoolMetadata:
 
     source: str = "unknown"
     imported_at: str = ""
+    """When the *data* was retrieved, not when this object was built.
+
+    For a live board this is the oldest contributing source's fetch time, so a board
+    assembled partly from an expired cache dates itself from the cache rather than
+    from the moment the user pressed the button.
+    """
+    timestamp_basis: str = core_freshness.FETCHED
+    """Whether :attr:`imported_at` is when the data was *fetched* or merely *loaded*.
+
+    A fetched board's timestamp is the age of the data. An uploaded file's is the age
+    of the upload and nothing more — a spreadsheet handed over a minute ago can hold
+    numbers from last August, and no column in it says so. Kept apart so the warning
+    can be accurate about which of the two it is measuring.
+    """
     season: int | None = None
     platform: str | None = None
     player_count: int = 0
@@ -368,6 +383,22 @@ class PoolMetadata:
     imputed_fields: dict[str, int] = field(default_factory=dict)
     notes: str = ""
 
+    def freshness(
+        self, *, expected_season: int | None = None
+    ) -> core_freshness.FreshnessVerdict:
+        """How old this pool is, and whether it is even the right season.
+
+        Delegated rather than decided here so the sidebar, the Setup page and the
+        Draft Room cannot disagree about what "stale" means. Pass the season being
+        drafted to have a last-season board reported as wrong rather than merely old.
+        """
+        return core_freshness.assess(
+            self.imported_at,
+            season=self.season,
+            expected_season=expected_season,
+            basis=self.timestamp_basis,
+        )
+
     def describe(self) -> str:
         bits = [f"{self.player_count} players", f"source: {self.source}"]
         if self.season:
@@ -375,7 +406,17 @@ class PoolMetadata:
         if self.platform:
             bits.append(f"platform {self.platform}")
         if self.imported_at:
-            bits.append(f"imported {self.imported_at}")
+            # The age, not just the timestamp: a raw ISO string asks the reader to
+            # do the subtraction, and the whole reason this line exists is that
+            # nobody does.
+            age = self.freshness().age_label()
+            bits.append(
+                f"loaded {age.replace(' old', ' ago')}"
+                if self.timestamp_basis == core_freshness.IMPORTED
+                else f"data {age}"
+            )
+        else:
+            bits.append("age unknown")
         if self.is_sample_data:
             bits.insert(0, "SAMPLE DATA")
         return " • ".join(bits)

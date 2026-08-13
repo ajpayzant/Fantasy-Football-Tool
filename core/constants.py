@@ -9,7 +9,7 @@ from __future__ import annotations
 from .enums import Position, Slot
 
 APP_NAME = "League-Aware Fantasy Mock Draft"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 """Bumped whenever the SQLite schema changes; stored in ``application_settings``.
 
 v2 added the provenance columns on ``players`` — the stored stat line a projection

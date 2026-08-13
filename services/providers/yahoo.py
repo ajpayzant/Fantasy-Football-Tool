@@ -92,8 +92,12 @@ class YahooProvider:
         pages_attempted = 0
         pages_failed = 0
         last_error = ""
-        fetched_at = ""
+        # Every page is cached separately, so a paged fetch is only as fresh as its
+        # *oldest* page. Taking the last page's timestamp would let one live page
+        # date a board mostly assembled from yesterday's cache.
+        page_timestamps: list[str] = []
         from_cache_pages = 0
+        stale_pages = 0
         oldest_cache_age: float | None = None
         url = ""
 
@@ -117,7 +121,10 @@ class YahooProvider:
                 # returns an error for a page past the end of the list, which is
                 # also how the natural end of the data is detected.
                 break
-            fetched_at = outcome.fetched_at or fetched_at
+            if outcome.fetched_at:
+                page_timestamps.append(outcome.fetched_at)
+            if outcome.stale_fallback:
+                stale_pages += 1
             if outcome.from_cache:
                 from_cache_pages += 1
                 if outcome.cache_age_seconds is not None:
@@ -129,6 +136,10 @@ class YahooProvider:
             if not page_rows:
                 break  # end of the list
             rows.extend(page_rows)
+
+        # min() rather than max(): the earliest retrieval time is the age of the
+        # board, because a consumer cannot use the fresh pages without the old ones.
+        fetched_at = min(page_timestamps) if page_timestamps else ""
 
         if not rows:
             report.error(
@@ -182,6 +193,7 @@ class YahooProvider:
             fetched_at=fetched_at,
             from_cache=from_cache_pages == pages_attempted and pages_attempted > 0,
             cache_age_seconds=oldest_cache_age,
+            stale_fallback=stale_pages > 0,
             report=report,
             notes=f"{len(drafted)} players, {pages_attempted} page(s)",
         )

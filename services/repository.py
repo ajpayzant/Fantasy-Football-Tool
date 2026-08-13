@@ -14,6 +14,7 @@ from typing import Any, Iterable, Sequence
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from core import freshness as core_freshness
 from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules, ShrinkageConfig
 from core.enums import Archetype, InjuryStatus, Platform, Position, Slot
@@ -580,7 +581,13 @@ def save_player_pool(
     row.platform = metadata.platform
     row.source_kind = source_kind
     row.file_name = file_name
-    row.imported_at = utcnow()
+    # The data's own timestamp, not the time of this save. Stamping ``utcnow()`` here
+    # meant a board fetched three days ago and saved today reloaded tomorrow looking
+    # brand new, which is the one thing the staleness warning has to be able to see.
+    row.imported_at = (
+        core_freshness.parse_timestamp(metadata.imported_at) or utcnow()
+    ).replace(tzinfo=None)
+    row.timestamp_basis = metadata.timestamp_basis or core_freshness.FETCHED
     row.player_count = len(pool)
     row.is_sample_data = bool(metadata.is_sample_data)
     row.notes = metadata.notes or ""
@@ -711,6 +718,7 @@ def load_player_pool(
     metadata = PoolMetadata(
         source=row.name,
         imported_at=row.imported_at.isoformat(timespec="seconds") if row.imported_at else "",
+        timestamp_basis=row.timestamp_basis or core_freshness.FETCHED,
         season=row.season,
         platform=row.platform,
         player_count=len(players),

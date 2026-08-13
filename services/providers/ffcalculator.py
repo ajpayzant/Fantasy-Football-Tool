@@ -192,6 +192,7 @@ class FFCalculatorProvider:
             fetched_at=outcome.fetched_at,
             from_cache=outcome.from_cache,
             cache_age_seconds=outcome.cache_age_seconds,
+            stale_fallback=outcome.stale_fallback,
             season=season,
             scoring_format=endpoint,
             report=report,

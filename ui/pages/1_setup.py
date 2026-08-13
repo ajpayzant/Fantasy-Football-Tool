@@ -41,6 +41,7 @@ from core.enums import (
     ScoringPreset,
     Slot,
 )
+from core.freshness import Freshness
 from core.validation import ValidationReport
 from engine.draft_order import round_slot_order, validate_custom_order
 from models.database import session_scope
@@ -169,6 +170,15 @@ SCORING_GROUPS: dict[str, tuple[tuple[str, str, str], ...]] = {
 
 _K_EDITOR_PRESET = "scoring_editor_seeded_preset"
 """Which preset the per-event number inputs below were last filled from."""
+
+_K_SOURCE_STATUS = "live_source_status"
+"""The per-source status of the last fetch.
+
+Kept in session state because the fetch ends in ``st.rerun()`` and anything rendered
+inside that run is discarded. Without stashing it, the one place that says which
+sources actually answered — and how old each one's data is — would be built and
+thrown away before the user could read it.
+"""
 
 
 def _scoring_editor(current: ScoringRules, preset: ScoringPreset) -> dict[str, float]:
@@ -353,6 +363,7 @@ if st.button("Fetch current player data", type="primary", key="fetch_live"):
             force_refresh=bool(force_refresh),
         )
     _report_messages(result.report, context="Live data")
+    st.session_state[_K_SOURCE_STATUS] = dict(result.source_status)
 
     if result.ok:
         state.set_pool(result.pool, source=result.pool.metadata.source)
@@ -392,11 +403,49 @@ if st.button("Fetch current player data", type="primary", key="fetch_live"):
 
 if state.pool() is not None and not state.is_sample_data():
     metadata = state.pool().metadata
-    st.success(
-        f"Loaded: {len(state.pool())} players — {metadata.source}"
-        + (f", fetched {metadata.imported_at}" if metadata.imported_at else ""),
-        icon="✅",
+    loaded_league = state.league()
+    verdict = metadata.freshness(
+        expected_season=loaded_league.config.season if loaded_league else None
     )
+    loaded_line = f"Loaded: {len(state.pool())} players — {metadata.source}"
+    if verdict.level is Freshness.WRONG_SEASON:
+        # Louder than the age warnings on purpose: this is not old data, it is data
+        # about a different set of players.
+        st.error(f"{loaded_line}. {verdict.headline()} {verdict.advice()}", icon="🕒")
+    elif verdict.is_concerning:
+        st.warning(
+            f"{loaded_line}. {verdict.headline()} Press **Fetch current player "
+            "data** above to replace it — anything this old is past the 12-hour "
+            "cache window, so the fetch will go to the network.",
+            icon="🕒",
+        )
+    else:
+        st.success(f"{loaded_line}, {verdict.age_label()}.", icon="✅")
+        if verdict.level is Freshness.AGING:
+            st.caption(verdict.advice())
+
+_source_status = st.session_state.get(_K_SOURCE_STATUS) or {}
+if _source_status:
+    with st.expander("Which sources built this board, and how old each one is"):
+        st.caption(
+            "A board is only as current as its oldest column. A source that could "
+            "not be reached falls back to whatever was cached, which keeps the board "
+            "usable — but its ADP is then as old as the cache, so it is named here "
+            "rather than blended in silently."
+        )
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Source": info.get("label", key),
+                    "Answered": "yes" if info.get("ok") else "no",
+                    "Players": info.get("rows", 0),
+                    "Age": info.get("detail", ""),
+                    "Notes": info.get("notes", ""),
+                }
+                for key, info in _source_status.items()
+            ]),
+            width="stretch", hide_index=True,
+        )
 
 st.divider()
 

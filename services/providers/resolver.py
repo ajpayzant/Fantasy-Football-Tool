@@ -179,7 +179,25 @@ def resolve_board(
             "detail": result.freshness_label(),
             "url": result.url,
             "notes": result.notes,
+            # The age travels as a number as well as inside ``detail``, because the
+            # board's own freshness is the worst of its sources and that cannot be
+            # computed by re-reading a sentence written for a human.
+            "fetched_at": result.fetched_at,
+            "age_hours": result.age_hours,
+            "from_cache": result.from_cache,
+            "stale_fallback": result.stale_fallback,
         }
+        if result.ok and result.stale_fallback:
+            # Only reported for a source that *succeeded*: a failed source already
+            # says why on its own report, while this one looks like a success and
+            # would otherwise put expired data on the board in silence.
+            report.warn(
+                f"{key}_stale_cache",
+                f"{result.source} could not be reached, so a cached copy from "
+                f"{result.freshness().age_label().replace(' old', ' ago')} was used "
+                "instead. Its ADP is that old. Clear the cache on Setup and re-fetch "
+                "once the source is back.",
+            )
         # Provider-level messages are re-raised here so the Setup page can show
         # every source's issues in one place.
         for issue in result.report.errors:
