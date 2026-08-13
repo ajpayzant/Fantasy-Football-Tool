@@ -561,16 +561,21 @@ with connect_tab:
             "Also import past drafts", value=True, key="espn_history",
         )
 
-    # Collapsed, because most leagues do not need it and an open pair of credential
-    # fields reads as a login wall on a tool that does not have one.
-    with st.expander("My league is private (two cookies, not a password)"):
+    # Collapsed, because a public league's current season needs none of it and an open
+    # pair of credential fields reads as a login wall on a tool that does not have one.
+    # Named for both jobs it does, though: past drafts need these even when the league is
+    # public, and a box labelled only "private" would look irrelevant to the user whose
+    # history import just came up empty.
+    with st.expander("Private league, or past drafts (two cookies, not a password)"):
         st.caption(
             "ESPN refuses to answer for a private league unless the request carries your "
-            "session. These two values **are** that session, so treat them like a "
-            "password — but note that they are not one, and this app never asks for your "
-            "ESPN login. They are sent to ESPN and nowhere else: never written to the "
-            "database, never written to a log, never shown back to you, and gone when you "
-            "reload this page. Where to find them is in *How the ESPN connect works* below."
+            "session — and it treats **last season as private even when this season is "
+            "public**, so past drafts need these too. The two values **are** that "
+            "session, so treat them like a password — but note that they are not one, "
+            "and this app never asks for your ESPN login. They are sent to ESPN and "
+            "nowhere else: never written to the database, never written to a log, never "
+            "shown back to you, and gone when you reload this page. Where to find them "
+            "is in *How the ESPN connect works* below."
         )
         cookie_row = st.columns(2)
         # type="password" on both: these are credentials and are masked on screen. Not

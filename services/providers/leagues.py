@@ -151,6 +151,10 @@ roster came out three short.
 # disagree with the number of rounds.
 ESPN_NON_DRAFT_SLOTS = frozenset({21, 24})  # IR, ER
 
+# ``ESPNFAN5108403063``, ``espn85157990`` — what ESPN shows for a manager with no display
+# name of their own, which on an anonymous read is most of them.
+ESPN_PLACEHOLDER_HANDLE = re.compile(r"^espn(?:fan)?\d+$", re.IGNORECASE)
+
 # ESPN's scoring is a list of {statId, points}. These are the ids whose value maps
 # onto a named field in :class:`core.config.ScoringRules`, so a real league's rules
 # come across as numbers rather than as a guessed preset. The ids themselves are
@@ -846,8 +850,39 @@ def _espn_manager_names(payload: dict[str, Any]) -> dict[int, str]:
         owner_name = next(
             (member_names[oid] for oid in owner_ids if oid in member_names), ""
         )
+        # ESPN hands out a placeholder handle — ESPNFAN5108403063 — to anyone who never
+        # set a display name, and shows it instead of a real one on an anonymous read. It
+        # identifies nobody the user could recognise, so the team name is the better
+        # label. Identity across seasons does not depend on this either way: that is
+        # joined on the owner GUID.
+        if owner_name and ESPN_PLACEHOLDER_HANDLE.match(owner_name):
+            owner_name = _espn_team_name(team) or owner_name
         names[team_id] = owner_name or _espn_team_name(team) or f"Team {team_id}"
     return names
+
+
+def _espn_team_owner_ids(payload: dict[str, Any]) -> dict[int, tuple[str, ...]]:
+    """Map ESPN team id → the member GUIDs that own it, for one season's payload.
+
+    The GUID is the only thing about a manager that never changes. Team names change
+    every August and display names change on a whim, so joining an old pick to a present
+    manager on either of those is a guess; joining on the GUID is not.
+    """
+    owners: dict[int, tuple[str, ...]] = {}
+    for team in payload.get("teams") or []:
+        if not isinstance(team, dict):
+            continue
+        team_id = _as_int(team.get("id"))
+        if team_id is None:
+            continue
+        ids: list[str] = []
+        primary = team.get("primaryOwner")
+        if primary:
+            ids.append(str(primary).upper())
+        raw = team.get("owners")
+        ids.extend(str(o).upper() for o in raw if o) if isinstance(raw, list) else None
+        owners[team_id] = tuple(dict.fromkeys(ids))
+    return owners
 
 
 def _espn_roster(settings: dict[str, Any], report: ValidationReport) -> RosterSettings:
@@ -1133,17 +1168,27 @@ def _espn_parse_draft(
     season: int,
     league_name: str,
     current_names: dict[str, str],
+    current_by_guid: dict[str, str] | None = None,
 ) -> HistoricalDraft | None:
     """Turn one season's ESPN payload into a historical draft, or ``None``.
 
-    ``None`` covers three cases that are all "nothing to learn here": the draft has not
-    happened, it has no picks, or ESPN would not tell us who the players were. The last
-    one matters — picks without names cannot be joined to a player and would enter the
-    profile as noise.
+    ``None`` covers three cases that are all "nothing to learn here": the draft has no
+    real picks, it is still running, or ESPN would not tell us who the players were. The
+    last one matters — picks without names cannot be joined to a player and would enter
+    the profile as noise.
+
+    What is deliberately *not* consulted is ``draftDetail.drafted``. For an upcoming
+    season ESPN pre-creates the whole board with ``playerId: -1`` in every seat, and for
+    a league whose draft was run offline it leaves ``drafted`` false on a board that is
+    completely filled in. The picks themselves are the only honest signal, so a pick
+    counts only once it names a real player.
     """
     detail = payload.get("draftDetail") or {}
-    picks = [p for p in (detail.get("picks") or []) if isinstance(p, dict)]
-    if not detail.get("drafted") or not picks:
+    picks = [
+        p for p in (detail.get("picks") or [])
+        if isinstance(p, dict) and (_as_int(p.get("playerId")) or 0) > 0
+    ]
+    if detail.get("inProgress") or not picks:
         return None
 
     player_ids = [pid for pid in (_as_int(p.get("playerId")) for p in picks) if pid]
@@ -1153,8 +1198,12 @@ def _espn_parse_draft(
 
     # Each season has its own membership, so names come from that season's payload —
     # then a manager still in the league is renamed to their current spelling, which is
-    # what joins an old pick onto a present profile.
+    # what joins an old pick onto a present profile. The GUID is tried first and the name
+    # only as a fallback: a manager who both renamed their team and changed their display
+    # name is still the same person, and only the GUID knows it.
     season_names = _espn_manager_names(payload)
+    season_owners = _espn_team_owner_ids(payload)
+    by_guid = current_by_guid or {}
     draft = HistoricalDraft(
         season=season,
         league_name=league_name,
@@ -1170,7 +1219,11 @@ def _espn_parse_draft(
         team_id = _as_int(pick.get("teamId"))
         raw_name = season_names.get(team_id or -1, "")
         manager_name = (
-            current_names.get(raw_name.lower(), raw_name)
+            next(
+                (by_guid[guid] for guid in season_owners.get(team_id or -1, ()) if guid in by_guid),
+                "",
+            )
+            or current_names.get(raw_name.lower(), raw_name)
             or (f"Team {team_id}" if team_id else "Unknown manager")
         )
         draft.picks.append(
@@ -1191,6 +1244,41 @@ def _espn_parse_draft(
     return draft if draft.picks else None
 
 
+def _espn_season_payload(
+    league_id: str, season: int, headers: dict[str, str]
+) -> tuple[dict[str, Any] | None, str]:
+    """Read one past season of a league, trying both paths ESPN has used for it.
+
+    The documented-by-folklore route for an old season is ``leagueHistory``, and as of
+    now it answers 404 for every league and every season — including seasons that read
+    perfectly well from the ordinary per-season path. So the per-season path is tried
+    first and ``leagueHistory`` is kept only as a fallback, in case ESPN turns it back on.
+    Whichever one answers, the error returned is the *first* one, because that is the
+    failure that actually describes why the season is unavailable.
+    """
+    views = "view=mSettings&view=mTeam&view=mDraftDetail"
+    attempts = (
+        (f"seasons/{season}/segments/0/leagues/{league_id}", views),
+        (f"leagueHistory/{league_id}", f"seasonId={season}&{views}"),
+    )
+    first_error = ""
+    for index, (path, params) in enumerate(attempts):
+        payload, error = _espn_get(
+            path,
+            params=params,
+            cache_key=f"espn_league_history_{league_id}_{season}_{index}",
+            ttl=DEFAULT_CACHE_TTL_SECONDS,
+            headers=headers,
+        )
+        # leagueHistory answers with a single-element list.
+        if isinstance(payload, list):
+            payload = payload[0] if payload else None
+        if isinstance(payload, dict):
+            return payload, ""
+        first_error = first_error or error or "unknown error"
+    return None, first_error
+
+
 def _espn_history(
     league_id: str,
     *,
@@ -1203,15 +1291,28 @@ def _espn_history(
 ) -> tuple[DraftHistory, tuple[int, ...]]:
     """Collect every past ESPN draft this league has, newest first.
 
-    ESPN keeps a league's old seasons behind a different path (``leagueHistory``) and
-    lists which seasons exist in ``status.previousSeasons``, so the seasons are
+    ESPN lists which seasons exist in ``status.previousSeasons``, so the seasons are
     enumerated rather than guessed at. The current season is included when its draft is
     complete: a finished draft is history whether or not the season is.
+
+    Making a league public opens the *current* season only — ESPN keeps the flag per
+    season, so an anonymous read of last year's draft is refused even though this year's
+    is wide open. That is a different problem from a season ESPN has genuinely lost, and
+    it is reported differently, because the fix (the two cookies) is one the user has.
     """
     history = DraftHistory()
     seasons: list[int] = []
     current_names = {
         clean_text(manager.name).lower(): manager.name for manager in managers
+    }
+    # GUID → the name this manager goes by now, so an old pick lands on a present
+    # profile regardless of what the team or the display name was called back then.
+    current_team_names = _espn_manager_names(current_payload)
+    current_by_guid = {
+        guid: current_names.get(name.lower(), name)
+        for team_id, guids in _espn_team_owner_ids(current_payload).items()
+        if (name := clean_text(current_team_names.get(team_id, "")))
+        for guid in guids
     }
     league_name = clean_text(
         (current_payload.get("settings") or {}).get("name")
@@ -1219,7 +1320,7 @@ def _espn_history(
 
     current = _espn_parse_draft(
         current_payload, season=current_season, league_name=league_name,
-        current_names=current_names,
+        current_names=current_names, current_by_guid=current_by_guid,
     )
     if current is not None:
         history.add(current)
@@ -1231,24 +1332,16 @@ def _espn_history(
         reverse=True,
     )
     unreadable: list[int] = []
+    locked: list[int] = []
     for season in past[: max(0, int(max_seasons) - len(seasons))]:
-        payload, error = _espn_get(
-            f"leagueHistory/{league_id}",
-            params=f"seasonId={season}&view=mSettings&view=mTeam&view=mDraftDetail",
-            cache_key=f"espn_league_history_{league_id}_{season}",
-            ttl=DEFAULT_CACHE_TTL_SECONDS,
-            headers=headers,
-        )
-        # leagueHistory answers with a single-element list.
-        if isinstance(payload, list):
-            payload = payload[0] if payload else None
-        if not isinstance(payload, dict):
-            unreadable.append(season)
+        payload, error = _espn_season_payload(league_id, season, headers)
+        if payload is None:
+            (locked if "401" in error or "403" in error else unreadable).append(season)
             LOGGER.info("ESPN history %s unavailable: %s", season, error)
             continue
         parsed = _espn_parse_draft(
             payload, season=season, league_name=league_name,
-            current_names=current_names,
+            current_names=current_names, current_by_guid=current_by_guid,
         )
         if parsed is None:
             unreadable.append(season)
@@ -1256,6 +1349,21 @@ def _espn_history(
         history.add(parsed)
         seasons.append(season)
 
+    if locked:
+        listed = ", ".join(str(s) for s in sorted(locked))
+        report.warn(
+            "espn_history_locked",
+            f"ESPN would not show season(s) {listed} without a login."
+            + (
+                " The cookies were accepted for this season but refused for those, which "
+                "usually means the account they belong to was not in the league yet."
+                if headers else
+                " Making a league public only opens the current season — ESPN keeps that "
+                "setting per season, so past drafts still need the two cookies from the "
+                "**Private league, or past drafts** box above. Add them and connect "
+                "again, or paste those recaps on the **Draft history** tab."
+            ),
+        )
     if unreadable:
         report.warn(
             "espn_history_gaps",
@@ -1264,14 +1372,14 @@ def _espn_history(
             "for old seasons and for leagues that changed hands. Paste those recaps on "
             "the Draft history tab if you want them.",
         )
-    if not history.drafts:
+    if not history.drafts and not locked:
         report.warn(
             "espn_no_history",
             "No completed draft was found for this league, so opponents will be modelled "
             "from archetype priors rather than their own habits. If your draft is done, "
             "paste the recap on the Draft history tab.",
         )
-    else:
+    elif history.drafts:
         report.info(
             "espn_history",
             f"Found {len(history.all_picks)} picks across {len(history.drafts)} completed "
@@ -1494,10 +1602,13 @@ def espn_league_instructions() -> str:
     return (
         "**Public leagues need nothing but the URL.** Paste your league's address and "
         "the app reads the league name, every team and manager, the scoring rules, the "
-        "starting lineup, and every completed draft ESPN still has — usually several "
-        "seasons back. That last part is what lets the model learn each manager's real "
-        "habits instead of assuming an average one.\n\n"
-        "**Private leagues need two cookies**, because ESPN refuses to answer for them "
+        "starting lineup, and this season's draft once it has been held.\n\n"
+        "**Past drafts are the exception, and they need the two cookies below — even "
+        "for a public league.** ESPN stores the public/private setting one season at a "
+        "time, so making your league public opens this year and leaves last year shut. "
+        "Past drafts are worth the extra step: they are what lets the model learn each "
+        "manager's real habits instead of assuming an average one.\n\n"
+        "**Private leagues need the same two cookies**, because ESPN refuses to answer "
         "otherwise. In a browser signed in to your league, open developer tools → "
         "*Application* (Chrome/Edge) or *Storage* (Firefox) → **Cookies** → "
         "`fantasy.espn.com`, and copy the values of `espn_s2` and `SWID`.\n\n"

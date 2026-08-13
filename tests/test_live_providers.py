@@ -789,8 +789,22 @@ ESPN_SCORING_ITEMS = [
 ]
 
 
-def _espn_league_payload(season: int, *, teams: int = 4, drafted: bool = True) -> dict:
-    """One season of an ESPN league, shaped the way ESPN shapes it."""
+def _espn_league_payload(
+    season: int,
+    *,
+    teams: int = 4,
+    drafted: bool = True,
+    placeholder: bool = False,
+    renamed: bool = False,
+) -> dict:
+    """One season of an ESPN league, shaped the way ESPN shapes it.
+
+    ``placeholder`` gives the board ESPN publishes for a draft that has not happened:
+    every seat present, ``playerId`` -1 in all of them. ``renamed`` changes both the team
+    names and the manager display names while keeping the owner GUIDs — a league between
+    two Augusts.
+    """
+    label = "was" if renamed else "manager"
     return {
         "id": 123456,
         "seasonId": season,
@@ -808,20 +822,23 @@ def _espn_league_payload(season: int, *, teams: int = 4, drafted: bool = True) -
         },
         "teams": [
             {
-                "id": i, "location": "Team", "nickname": str(i),
+                "id": i,
+                "location": "Old" if renamed else "Team",
+                "nickname": f"name {i}" if renamed else str(i),
                 "owners": [f"{{GUID-{i}}}"], "primaryOwner": f"{{GUID-{i}}}",
             }
             for i in range(1, teams + 1)
         ],
         "members": [
-            {"id": f"{{GUID-{i}}}", "displayName": f"manager{i}"}
+            {"id": f"{{GUID-{i}}}", "displayName": f"{label}{i}"}
             for i in range(1, teams + 1)
         ],
         "draftDetail": {
             "drafted": drafted,
             "picks": [
                 {
-                    "playerId": 1000 + i, "teamId": (i % teams) + 1,
+                    "playerId": -1 if placeholder else 1000 + i,
+                    "teamId": (i % teams) + 1,
                     "roundId": (i // teams) + 1, "roundPickNumber": (i % teams) + 1,
                     "overallPickNumber": i + 1, "keeper": False,
                 }
@@ -836,6 +853,10 @@ def _espn_transport(
     seasons: tuple[int, ...] = (2026,),
     fail: str = "",
     missing: str = "HTTP 404 Not Found",
+    leaguehistory_error: str = "",
+    rename_history: bool = False,
+    drafted: bool = True,
+    placeholder: bool = False,
 ):
     """A stand-in for ``leagues._espn_get``, at the request boundary.
 
@@ -859,12 +880,20 @@ def _espn_transport(
                 for pid in ids
             ], ""
         if path.startswith("leagueHistory"):
+            if leaguehistory_error:
+                return None, leaguehistory_error
             year = int(params.split("seasonId=")[1].split("&")[0])
-            return [_espn_league_payload(year)], ""
+            return [_espn_league_payload(year, renamed=rename_history)], ""
         year = int(path.split("seasons/")[1].split("/")[0])
         if year not in seasons:
             return None, missing
-        return _espn_league_payload(year), ""
+        # The highest season the transport serves stands in for "this year"; the flags
+        # that describe an unheld draft belong to it and not to the archive.
+        if year == max(seasons):
+            return _espn_league_payload(
+                year, drafted=drafted, placeholder=placeholder
+            ), ""
+        return _espn_league_payload(year, renamed=rename_history), ""
 
     _get.calls = calls
     return _get
@@ -1085,6 +1114,128 @@ def test_an_espn_draft_with_no_resolvable_players_is_skipped_not_imported() -> N
     assert leagues_module._espn_parse_draft(
         _espn_league_payload(2026), season=2026, league_name="X", current_names={},
     ) is None
+
+
+def test_an_espn_manager_with_no_display_name_is_labelled_by_their_team() -> None:
+    """A real public league came back as nine rows of ``ESPNFAN5108403063``.
+
+    That is what ESPN shows for a manager who never set a display name, and it identifies
+    nobody. The team name is at least something the user recognises. A real handle is
+    still preferred over a team name, because it survives the annual renaming.
+    """
+    from services.providers import leagues as leagues_module
+
+    payload = {
+        "teams": [
+            {"id": 1, "location": "Kittlehead", "nickname": "IPA",
+             "primaryOwner": "{G-1}", "owners": ["{G-1}"]},
+            {"id": 2, "location": "Mac n", "nickname": "Chase",
+             "primaryOwner": "{G-2}", "owners": ["{G-2}"]},
+            {"id": 3, "location": "JT", "nickname": "Coming",
+             "primaryOwner": "{G-3}", "owners": ["{G-3}"]},
+        ],
+        "members": [
+            {"id": "{G-1}", "displayName": "ESPNFAN5108403063"},
+            {"id": "{G-2}", "displayName": "espn85157990"},
+            {"id": "{G-3}", "displayName": "AJPayzant21"},
+        ],
+    }
+    assert leagues_module._espn_manager_names(payload) == {
+        1: "Kittlehead IPA", 2: "Mac n Chase", 3: "AJPayzant21",
+    }
+
+
+def test_a_past_espn_season_is_read_from_whichever_path_still_answers(
+    espn_leagues,
+) -> None:
+    """``leagueHistory`` is the folklore route for an old season, and it is currently 404.
+
+    It answers 404 for every league and every season, including ones that read perfectly
+    well from the ordinary per-season path — so a history import that only knew
+    ``leagueHistory`` returned nothing for everybody. Both are tried, per-season first.
+    """
+    leagues_module, transport = espn_leagues(
+        seasons=(2026, 2025), leaguehistory_error="HTTP 404 Not Found",
+    )
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    assert result.ok
+    assert 2025 in result.seasons_found
+    assert {pick.season for pick in result.history.all_picks} >= {2025}
+    # 2025 came off the per-season path, so leagueHistory was never asked for it.
+    assert not any(
+        path.startswith("leagueHistory") and "2025" in params
+        for path, params, _headers in transport.calls
+    )
+
+
+def test_a_public_league_says_why_last_years_draft_is_missing(espn_leagues) -> None:
+    """The user made their league public, connected, and got no history. Why, exactly.
+
+    ESPN stores public/private one season at a time, so opening this year leaves last
+    year shut and an anonymous read of it is refused. That is not a lost season and it is
+    not a broken app — it is a fixable thing, and the fix is the two cookies. Saying "no
+    draft could be read" instead would send the user looking for a problem ESPN does not
+    have.
+    """
+    leagues_module, _ = espn_leagues(
+        seasons=(2026,), missing="HTTP 401 Unauthorized",
+        leaguehistory_error="HTTP 404 Not Found", placeholder=True,
+    )
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    assert result.ok, [i.message for i in result.report.errors]
+    warnings = {i.code: i.message for i in result.report.warnings}
+    assert "espn_history_locked" in warnings
+    message = warnings["espn_history_locked"]
+    assert "2024, 2025" in message
+    assert "only opens the current season" in message
+    assert "cookies" in message and "Draft history" in message
+    # And not the wrong diagnosis on top of the right one.
+    assert "espn_history_gaps" not in warnings
+    assert "espn_no_history" not in warnings
+
+
+def test_a_finished_draft_is_imported_even_when_espn_denies_it_happened(
+    espn_leagues,
+) -> None:
+    """``draftDetail.drafted`` is not reliable, in both directions.
+
+    A real league — 10 teams, 16 rounds, a full board — reported ``drafted: false`` on
+    160 picks, and gating on the flag threw the whole draft away. Meanwhile the flag says
+    nothing useful about an *upcoming* season, where ESPN pre-creates every seat with
+    ``playerId: -1``. So the picks decide, not the flag: a seat counts once it names a
+    real player.
+    """
+    leagues_module, _ = espn_leagues(drafted=False)
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    assert 2026 in result.seasons_found
+    assert len([p for p in result.history.all_picks if p.season == 2026]) == 12
+
+    leagues_module, _ = espn_leagues(placeholder=True, drafted=True)
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    assert 2026 not in result.seasons_found, "an unheld draft was imported as history"
+    assert not [p for p in result.history.all_picks if p.season == 2026]
+
+
+def test_espn_history_follows_the_manager_not_the_team_name(espn_leagues) -> None:
+    """Whoever drafted in 2024 is the same person now, whatever they renamed themselves.
+
+    Team names change every August and display names change on a whim. The owner GUID
+    does not, so it is joined on first — otherwise an old draft lands on a manager who
+    does not exist and the present manager looks like a first-timer.
+    """
+    leagues_module, _ = espn_leagues(seasons=(2026, 2025, 2024), rename_history=True)
+    result = leagues_module.fetch_espn_league("123456", season=2026)
+    current = {manager.name for manager in result.league.managers}
+    assert current == {"manager1", "manager2", "manager3", "manager4"}
+    old_picks = [pick for pick in result.history.all_picks if pick.season < 2026]
+    assert old_picks
+    # Not "was1"/"Old name 1", which is what the payload called them at the time.
+    assert {pick.manager_name for pick in old_picks} == current
+    # Each old team still maps to its own manager, rather than all collapsing onto one.
+    by_team = {
+        (pick.season, pick.pick_in_round): pick.manager_name for pick in old_picks
+    }
+    assert len(set(by_team.values())) == 4
 
 
 def test_a_pasted_sleeper_url_reaches_the_same_league_as_the_bare_id() -> None:
