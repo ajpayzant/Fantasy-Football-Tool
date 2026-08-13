@@ -136,6 +136,97 @@ with st.expander("Where every number on this page comes from"):
 st.divider()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# The user's own board
+#
+# Kept on this page rather than in the Draft Room because it is preparation, not a
+# live decision: this is where the user reads the pool and forms the opinions the
+# lists record. The Draft Room then obeys them.
+# ─────────────────────────────────────────────────────────────────────────────
+board = state.user_board()
+with st.expander(
+    f"🎯 Your board — targets, do-not-draft and your own rankings ({board.describe()})",
+    expanded=board.is_empty,
+):
+    st.caption(
+        "These three lists are **yours**, and they change only what this app "
+        "recommends to you. The eleven opponents never see them — they keep drafting "
+        "the players you have sworn off, because that is what they would really do, "
+        "and pretending otherwise would make every availability percentage wrong."
+    )
+    board_left, board_middle, board_right = st.columns(3)
+    with board_left:
+        st.markdown("**Targets**")
+        st.caption("One per line, best first. The order is the priority.")
+        targets_text = st.text_area(
+            "Targets", value="\n".join(board.targets), height=200,
+            key="board_targets", label_visibility="collapsed",
+            placeholder="Ja'Marr Chase\nBijan Robinson",
+        )
+    with board_middle:
+        st.markdown("**Never draft**")
+        st.caption("Kept out of every suggestion, whatever the model thinks.")
+        avoid_text = st.text_area(
+            "Never draft", value="\n".join(board.avoid), height=200,
+            key="board_avoid", label_visibility="collapsed",
+            placeholder="A player you will not take",
+        )
+    with board_right:
+        st.markdown("**Your own rankings**")
+        st.caption(
+            "Optional and partial is fine — `1. Player` numbering is honoured, plain "
+            "lines take their place in the list."
+        )
+        ranks_text = st.text_area(
+            "Your rankings",
+            value="\n".join(
+                f"{rank}. {name}"
+                for name, rank in sorted(board.custom_ranks.items(), key=lambda kv: kv[1])
+            ),
+            height=200, key="board_ranks", label_visibility="collapsed",
+            placeholder="1. Ja'Marr Chase\n2. Bijan Robinson",
+        )
+
+    save_column, clear_column, _ = st.columns([1, 1, 3])
+    if save_column.button("Save my board", type="primary", key="board_save"):
+        from services.user_board import UserBoard, parse_names, parse_rankings
+
+        state.set_user_board(UserBoard(
+            targets=parse_names(targets_text),
+            avoid=parse_names(avoid_text),
+            custom_ranks=parse_rankings(ranks_text),
+        ))
+        components.flash("Board saved. It applies to every draft from here on.")
+        st.rerun()
+    if clear_column.button("Clear it", key="board_clear"):
+        from services.user_board import UserBoard
+
+        state.set_user_board(UserBoard())
+        components.flash("Board cleared.")
+        st.rerun()
+
+    if board.conflicts:
+        st.warning(
+            "On both lists, so treated as never-draft: "
+            + ", ".join(board.conflicts)
+            + ". Refusing to draft someone is the safer reading of a contradiction "
+            "than recommending them.",
+            icon="⚠️",
+        )
+    unmatched = board.unmatched(pool)
+    if unmatched:
+        st.warning(
+            "These names match nobody in the current player pool, so they do nothing: "
+            + "; ".join(
+                f"**{label.replace('_', ' ')}** — {', '.join(names)}"
+                for label, names in unmatched.items()
+            )
+            + ". Check the spelling, or the player may not be in this file at all.",
+            icon="⚠️",
+        )
+
+st.divider()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Filters
 # ─────────────────────────────────────────────────────────────────────────────
 filter_columns = st.columns([2, 1, 1, 1])
@@ -166,6 +257,10 @@ sort_options = {
     "Fantasy Football Calculator ADP": ("ffc_adp", True),
     "Sleeper popularity": ("sleeper_rank", True),
 }
+if board.custom_ranks:
+    # Offered only when there is something to sort by, so the option never appears
+    # and then silently falls back to ADP.
+    sort_options = {"My own ranking": ("my_rank", True), **sort_options}
 sort_choice = sort_columns[0].selectbox("Sort by", list(sort_options))
 row_limit = sort_columns[1].number_input(
     "Rows to show", min_value=10, max_value=1000, value=100, step=10
@@ -180,6 +275,36 @@ column_set = sort_columns[3].radio(
 )
 
 view = frame.copy()
+# The board's own columns, added before filtering so they can be filtered on. Keyed by
+# player id via the pool, because the board matches on name and the frame does not
+# carry the match key.
+if not board.is_empty:
+    marks: dict[str, str] = {}
+    my_ranks: dict[str, int] = {}
+    for player in pool:
+        priority = board.target_priority(player)
+        if priority is not None:
+            marks[player.player_id] = f"🎯 {priority}"
+        elif board.is_avoided(player):
+            marks[player.player_id] = "⛔"
+        own = board.custom_rank(player)
+        if own is not None:
+            my_ranks[player.player_id] = own
+    view["board_mark"] = view["player_id"].map(marks).fillna("")
+    view["my_rank"] = view["player_id"].map(my_ranks)
+    board_columns = st.columns([1, 1, 3])
+    only_mine = board_columns[0].checkbox(
+        "Only my targets", help="Show just the players on your target list."
+    )
+    hide_avoided = board_columns[1].checkbox(
+        "Hide never-draft", value=True,
+        help="Hide the players on your do-not-draft list. They are still on the real "
+             "board — your opponents can and will take them.",
+    )
+    if only_mine:
+        view = view[view["board_mark"].str.startswith("🎯")]
+    if hide_avoided:
+        view = view[view["board_mark"] != "⛔"]
 if positions:
     wanted = {str(p) for p in positions}
     view = view[view["position"].astype(str).isin(wanted)]
@@ -225,6 +350,7 @@ display = view.head(int(row_limit)).rename(columns={
     "yahoo_adp": "Yahoo ADP", "sleeper_rank": "Sleeper",
     "adp_source_count": "Sources", "adp_disagreement": "Disagreement",
     "projection_source": "Projection from",
+    "board_mark": "My list", "my_rank": "My rank",
 })
 
 VALUE_COLUMNS = [
@@ -236,10 +362,23 @@ PLATFORM_COLUMNS = [
     "FFC ADP", "ESPN ADP", "ESPN rank", "Yahoo ADP", "Sleeper", "Proj", "VOR",
 ]
 wanted = VALUE_COLUMNS if column_set == "Value" else PLATFORM_COLUMNS
+if not board.is_empty:
+    # Beside the name, where a marker is read rather than hunted for.
+    wanted = [wanted[0], "My list", "My rank", *wanted[1:]]
 st.dataframe(
     display[[c for c in wanted if c in display.columns]],
     width="stretch", hide_index=True, height=460,
     column_config={
+        "My list": st.column_config.TextColumn(
+            "My list",
+            help="🎯 with its priority for a target, ⛔ for a player you have said "
+                 "you will never draft.",
+        ),
+        "My rank": st.column_config.NumberColumn(
+            "My rank", format="%d",
+            help="Your own ranking, from the board above. Blank where you have not "
+                 "ranked the player and the consensus order is used instead.",
+        ),
         "Risk": st.column_config.ProgressColumn(
             "Risk", min_value=0.0, max_value=1.0, format="%.2f",
             help="0 = the room agrees and he is healthy, 1 = nobody can place him. "

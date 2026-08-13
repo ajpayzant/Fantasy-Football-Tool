@@ -39,6 +39,7 @@ K_DRAFT = "draft_state"
 K_SETTINGS = "settings"
 K_IS_SAMPLE = "is_sample_data"
 K_PROVENANCE = "provenance"
+K_USER_BOARD = "user_board"
 K_LAST_RECS = "last_recommendations"
 K_LAST_AVAIL = "last_availability"
 K_MC_REPORT = "monte_carlo_report"
@@ -111,6 +112,45 @@ def provenance() -> Provenance:
 
 def is_sample_data() -> bool:
     return bool(st.session_state.get(K_IS_SAMPLE))
+
+
+def user_board():
+    """The user's targets, do-not-draft list and own rankings.
+
+    Loaded from the database on first use in a session rather than in
+    ``ensure_initialised``, so a database problem cannot stop the app starting, and
+    then cached — a board is read on every render of two pages.
+
+    Returns a ``services.user_board.UserBoard``; the import is local because
+    ``services`` reaches the database and this module is imported by every page.
+    """
+    from services.user_board import UserBoard, load_board
+
+    board = st.session_state.get(K_USER_BOARD)
+    if isinstance(board, UserBoard):
+        return board
+    board = load_board()
+    st.session_state[K_USER_BOARD] = board
+    return board
+
+
+def set_user_board(board, *, persist: bool = True) -> None:
+    """Replace the board and, by default, save it.
+
+    Saved rather than held in session state alone because it is a slow thing to type
+    and a fast thing to lose: it survives a refresh and every future session.
+    """
+    st.session_state[K_USER_BOARD] = board
+    if persist:
+        try:
+            from services.user_board import save_board
+
+            save_board(board)
+        except Exception:
+            LOGGER.exception("Could not save the board")
+    # Recommendations are computed with the board, so an edited board makes the
+    # cached set stale in exactly the way a new pick would.
+    _clear_derived()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,5 +303,6 @@ __all__ = [
     "draft", "settings", "provenance", "is_sample_data", "set_league", "set_pool",
     "set_history", "set_profiles", "set_draft", "set_settings", "mark_sample_data",
     "cached", "readiness", "blocking_reason", "discard_saved_draft",
-    "K_LAST_RECS", "K_LAST_AVAIL", "K_MC_REPORT",
+    "user_board", "set_user_board",
+    "K_LAST_RECS", "K_LAST_AVAIL", "K_MC_REPORT", "K_USER_BOARD",
 ]

@@ -378,12 +378,18 @@ if not draft.is_complete:
     if auto or run_now:
         # Stamped on the pick index so a recommendation computed two picks ago is
         # never shown as if it applied to the current board.
-        stamp = (draft.pick_index, int(simulations), int(shortlist_size))
+        # The board is part of the stamp because it is part of the answer: editing a
+        # target list must recompute, and the cache cannot see inside the object.
+        stamp = (
+            draft.pick_index, int(simulations), int(shortlist_size),
+            state.user_board().fingerprint,
+        )
         with st.spinner(f"Simulating {simulations} rollouts to your next pick…"):
             recommendation_set = state.cached(
                 "recommendations",
                 lambda: recommend_for(
                     draft, profiles,
+                    board=state.user_board(),
                     simulations=int(simulations),
                     shortlist_size=int(shortlist_size),
                     seed=draft.seed,
@@ -419,6 +425,11 @@ if not draft.is_complete:
                 st.markdown(
                     f"**{recommendation.lens_label}**"
                     + ("  ⭐ consensus" if recommendation.is_consensus else "")
+                    + ("  🎯 on your target list" if recommendation.is_target else "")
+                    + (
+                        f"  📋 your #{recommendation.board_rank}"
+                        if recommendation.board_rank else ""
+                    )
                 )
                 st.markdown(
                     f"### {player.name}  \n"

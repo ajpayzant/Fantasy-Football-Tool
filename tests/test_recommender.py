@@ -134,7 +134,7 @@ class TestRecommendationShape:
     ) -> None:
         engine = RecommendationEngine(at_user_turn, profiles)
         context = engine._context(USER_SLOT)
-        shortlist = engine._shortlist(context, 12)
+        shortlist, _hidden = engine._shortlist(context, 12)
         best = max(shortlist, key=lambda c: c.utility)
         result = engine.recommend(simulations=FAST_SIMS, seed=4)
         assert result.by_lens(
@@ -242,7 +242,7 @@ class TestLensesDiverge:
             if state.is_complete:
                 break
             context = engine._context(USER_SLOT)
-            shortlist = engine._shortlist(context, 12)
+            shortlist, _hidden = engine._shortlist(context, 12)
             startable = [
                 c for c in shortlist
                 if context.view.fills_starting_slot(c.player.position)

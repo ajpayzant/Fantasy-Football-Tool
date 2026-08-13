@@ -1,6 +1,6 @@
 """Pick recommendations for the user, from several deliberately different angles.
 
-The engine answers one question — "who should I take?" — eight ways, because there
+The engine answers one question — "who should I take?" — nine ways, because there
 is no single correct answer to it. A user at pick 3.04 genuinely faces a trade-off
 between the best player left, the one who fits their roster, and the one who will
 not survive the twelve picks until their next turn. Collapsing that into one
@@ -18,6 +18,12 @@ afford to roll the board forward a hundred times and get the real answer.
 model, using the user's own manager profile. The user is modelled as a manager
 like any other, so the recommendation is calibrated to the same board the
 opponents are picking from rather than to an abstract best-player list.
+
+One lens is not the model's opinion at all: ``YOUR_BOARD`` reports the user's own
+target list and rankings (see :mod:`services.user_board`). It is scored separately and
+labelled as theirs, and the do-not-draft list is applied to the shortlist every other
+lens draws from. None of it reaches the simulator — the opponents keep taking the
+players the user has sworn off, because that is what they would really do.
 
 Nothing here imports Streamlit. The UI renders :class:`Recommendation` objects; it
 does not compute them.
@@ -47,6 +53,7 @@ from engine.simulator import (
 )
 from models.manager import ManagerProfile, baseline_profile
 from models.player import Player
+from services.user_board import EMPTY_BOARD, UserBoard
 
 LOGGER = logging.getLogger("fantasy_mock_draft.recommender")
 
@@ -123,6 +130,10 @@ class Recommendation:
     components: dict[str, float] = field(default_factory=dict)
     is_consensus: bool = False
     """True when more than one lens picked this player. Set by the engine."""
+    is_target: bool = False
+    """True when the user put this player on their own target list."""
+    board_rank: int | None = None
+    """The user's own ranking for this player, when they supplied one."""
 
     @property
     def player_id(self) -> str:
@@ -148,6 +159,8 @@ class Recommendation:
             "headline": self.headline,
             "detail": list(self.detail),
             "is_consensus": self.is_consensus,
+            "is_target": self.is_target,
+            "board_rank": self.board_rank,
         }
 
 
@@ -165,6 +178,12 @@ class RecommendationSet:
     roster_summary: str = ""
     warnings: list[str] = field(default_factory=list)
     """Things the user should know regardless of which lens they follow."""
+    hidden_by_board: list[str] = field(default_factory=list)
+    """Players kept off every lens because they are on the do-not-draft list.
+
+    Reported rather than silently dropped: a user who cannot see that the model wanted
+    to suggest someone has no way to tell a working exclusion from a broken engine.
+    """
     elapsed_seconds: float = 0.0
 
     def by_lens(self, lens: RecommendationLens) -> Recommendation | None:
@@ -324,13 +343,26 @@ class RecommendationEngine:
     call it after every board change without invalidating anything.
     """
 
-    __slots__ = ("state", "profiles")
+    __slots__ = ("state", "profiles", "board")
 
     def __init__(
-        self, state: DraftState, profiles: Mapping[int, ManagerProfile]
+        self,
+        state: DraftState,
+        profiles: Mapping[int, ManagerProfile],
+        *,
+        board: UserBoard | None = None,
     ) -> None:
         self.state = state
         self.profiles = dict(profiles)
+        self.board = board or EMPTY_BOARD
+        """The user's own targets, exclusions and rankings.
+
+        Applied only here. The simulator and the pick model never see it, so the
+        opponents keep drafting the players the user has sworn off — which is the
+        point: a do-not-draft list is a statement about the user's own picks, and a
+        room that politely avoided their least-favourite players too would make every
+        availability number wrong.
+        """
 
     # -- context ---------------------------------------------------------
     def _profile_for(self, draft_slot: int) -> ManagerProfile:
@@ -364,15 +396,35 @@ class RecommendationEngine:
 
     def _shortlist(
         self, context: PickContext, shortlist_size: int
-    ) -> list[ScoredCandidate]:
+    ) -> tuple[list[ScoredCandidate], list[str]]:
+        """The candidates every lens chooses from, plus who the board excluded.
+
+        Do-not-draft players are removed *after* the pick probabilities are computed
+        and *before* the list is trimmed. Both halves of that matter: the probability
+        is a statement about the room, which the user's own list does not change; and
+        trimming afterwards keeps the shortlist a full ``shortlist_size`` rather than
+        letting three exclusions quietly turn twelve options into nine.
+        """
         ranked = score_candidates(context)
         if not ranked:
-            return []
+            return [], []
         temperature = self.state.settings.temperature_for(
             float(context.profile.get("predictability"))
         )
         pick_probabilities(ranked, temperature)
-        return ranked[:shortlist_size]
+        if self.board.is_empty:
+            return ranked[:shortlist_size], []
+        keep: list[ScoredCandidate] = []
+        hidden: list[str] = []
+        for candidate in ranked:
+            if self.board.is_avoided(candidate.player):
+                # Only worth naming if he would otherwise have been on the shortlist;
+                # "we hid the 250th-best player" is noise.
+                if len(keep) < shortlist_size:
+                    hidden.append(candidate.player.name)
+                continue
+            keep.append(candidate)
+        return keep[:shortlist_size], hidden
 
     # -- the public call --------------------------------------------------
     def recommend(
@@ -399,13 +451,17 @@ class RecommendationEngine:
             )
         target = int(draft_slot if draft_slot is not None else slot.draft_slot)
         context = self._context(target)
-        shortlist = self._shortlist(context, max(1, int(shortlist_size)))
+        shortlist, hidden = self._shortlist(context, max(1, int(shortlist_size)))
         if not shortlist:
             return RecommendationSet(
                 overall_pick=int(slot.overall_pick),
                 round_number=int(slot.round_number),
                 draft_slot=target,
-                warnings=["No draftable players remain."],
+                hidden_by_board=hidden,
+                warnings=[
+                    "Every player left is on your do-not-draft list."
+                    if hidden else "No draftable players remain."
+                ],
             )
 
         report = availability if availability is not None else simulate_availability(
@@ -427,10 +483,13 @@ class RecommendationEngine:
             pressure=pressure,
             picks_until_next=int(report.picks_until_next),
             roster_summary=self._roster_summary(context),
+            hidden_by_board=hidden,
         )
         result.recommendations = self._build_lenses(context, shortlist, report, pressure)
         self._mark_consensus(result)
-        result.warnings = self._warnings(context, shortlist, report, pressure)
+        result.warnings = self._warnings(
+            context, shortlist, report, pressure, hidden
+        )
         result.elapsed_seconds = time.perf_counter() - started
         LOGGER.info(
             "Recommendations for pick %s: %d lenses in %.2fs",
@@ -472,6 +531,8 @@ class RecommendationEngine:
                 headline=headline,
                 detail=detail,
                 components=dict(candidate.components),
+                is_target=self.board.is_target(candidate.player),
+                board_rank=self.board.custom_rank(candidate.player),
             )
 
         out: list[Recommendation] = []
@@ -486,7 +547,59 @@ class RecommendationEngine:
             f"({best.probability:.0%} of managers in your spot would take him)",
         ))
 
-        # 2. BEST_FIT — need and scarcity, not raw value.
+        # 2. YOUR_BOARD — the user's own list, obeyed rather than second-guessed.
+        #    Fires only when they have said something: a target still available, or a
+        #    personal ranking that disagrees with the platform's. Placed second so it
+        #    sits beside the model's own answer and the user can see the gap between
+        #    what they said they wanted and what the board says is best.
+        on_board = [
+            c for c in shortlist
+            if self.board.target_priority(c.player) is not None
+            or self.board.custom_rank(c.player) is not None
+        ]
+        if on_board:
+            mine = min(on_board, key=lambda c: self.board.sort_key(c.player))
+            priority = self.board.target_priority(mine.player)
+            my_rank = self.board.custom_rank(mine.player)
+            if priority is not None:
+                headline = (
+                    f"{mine.player.name} is the highest player on your target list "
+                    f"still available (your #{priority})"
+                )
+            else:
+                headline = (
+                    f"{mine.player.name} is the top player on your own rankings "
+                    f"still available (your #{my_rank})"
+                )
+            extra = []
+            if my_rank is not None:
+                board_rank = mine.player.rank_for()
+                if board_rank is not None:
+                    gap = int(board_rank) - int(my_rank)
+                    extra.append(
+                        f"you rank him {my_rank}, the consensus has him "
+                        f"{board_rank:.0f} — "
+                        + (
+                            f"{gap} spots higher on your board" if gap > 0
+                            else f"{abs(gap)} spots lower on your board" if gap < 0
+                            else "you and the consensus agree"
+                        )
+                    )
+            if mine.utility < best.utility:
+                extra.append(
+                    f"the model prefers {best.player.name} here; this lens is your "
+                    "own list, not its opinion"
+                )
+            # Negated so "higher score is better" holds here as it does in every
+            # other lens, and finite so it renders: an unranked target would make
+            # the raw sort key infinite.
+            out.append(build(
+                RecommendationLens.YOUR_BOARD, mine,
+                -float(priority if priority is not None else (my_rank or 0)),
+                headline, extra=extra,
+            ))
+
+        # 3. BEST_FIT — need and scarcity, not raw value.
         fit = max(shortlist, key=lambda c: _fit_score(c, view))
         fit_value = _fit_score(fit, view)
         out.append(build(
@@ -497,7 +610,7 @@ class RecommendationEngine:
             ],
         ))
 
-        # 3. BEST_VALUE — furthest past ADP. Only fires on an actual faller.
+        # 4. BEST_VALUE — furthest past ADP. Only fires on an actual faller.
         value = max(shortlist, key=lambda c: _value_score(c, context.overall_pick))
         value_score = _value_score(value, context.overall_pick)
         if value_score > 0:
@@ -509,7 +622,7 @@ class RecommendationEngine:
                 f"of {adp:.0f}",
             ))
 
-        # 4. SAFEST — highest floor, healthiest, least variance.
+        # 5. SAFEST — highest floor, healthiest, least variance.
         safe = max(shortlist, key=_safety_score)
         out.append(build(
             RecommendationLens.SAFEST, safe, _safety_score(safe),
@@ -520,7 +633,7 @@ class RecommendationEngine:
             ],
         ))
 
-        # 5. HIGHEST_UPSIDE — ceiling above projection, discounted by downside.
+        # 6. HIGHEST_UPSIDE — ceiling above projection, discounted by downside.
         upside = max(shortlist, key=lambda c: _upside_score(c, pool_span))
         if _upside_score(upside, pool_span) > 0:
             out.append(build(
@@ -530,7 +643,7 @@ class RecommendationEngine:
                 f"season ({upside.player.upside:+.0f} over his projection)",
             ))
 
-        # 6. SCARCITY — the position about to be drained, if any is.
+        # 7. SCARCITY — the position about to be drained, if any is.
         scarce_position = self._scarcest_position(pressure, view)
         if scarce_position is not None:
             at_position = [
@@ -550,7 +663,7 @@ class RecommendationEngine:
                     ],
                 ))
 
-        # 7. LAST_CHANCE — a player you will not see again, ranked by what you
+        # 8. LAST_CHANCE — a player you will not see again, ranked by what you
         #    would lose. Utility × the odds he is gone: a marginal player who is
         #    certain to vanish is not a crisis.
         endangered = [
@@ -574,7 +687,7 @@ class RecommendationEngine:
                 ),
             ))
 
-        # 8. ALTERNATIVE — the best candidate at a *different* position from the
+        # 9. ALTERNATIVE — the best candidate at a *different* position from the
         #    headline pick, so the user always sees the road not taken. Held to a
         #    utility floor so it is a real option rather than a token contrast.
         floor = best_utility * ALTERNATIVE_MIN_UTILITY_SHARE
@@ -658,6 +771,7 @@ class RecommendationEngine:
         shortlist: Sequence[ScoredCandidate],
         report: AvailabilityReport,
         pressure: Mapping[Position, float],
+        hidden: Sequence[str] = (),
     ) -> list[str]:
         """Things true regardless of which lens the user follows."""
         warnings: list[str] = []
@@ -674,6 +788,26 @@ class RecommendationEngine:
             warnings.append(
                 f"Availability is based on only {report.simulations} rollouts; "
                 "treat the percentages as indicative."
+            )
+        # A target about to vanish is the one warning worth interrupting for, because
+        # it is the only one the user cannot work out from the lenses: the last-chance
+        # lens names a single player, and it is chosen by utility, so the player *they*
+        # asked about can be about to disappear without ever being mentioned.
+        for candidate in shortlist:
+            priority = self.board.target_priority(candidate.player)
+            if priority is None:
+                continue
+            survival = report.survival(candidate.player_id)
+            if survival <= LAST_CHANCE_SURVIVAL and report.picks_until_next > 0:
+                warnings.append(
+                    f"Your target {candidate.player.name} (your #{priority}) has only "
+                    f"a {survival:.0%} chance of lasting the "
+                    f"{report.picks_until_next} picks until your next turn."
+                )
+        if hidden:
+            warnings.append(
+                "Hidden from every suggestion because they are on your do-not-draft "
+                "list: " + ", ".join(hidden) + "."
             )
         endangered = [
             c for c in shortlist
@@ -704,6 +838,8 @@ class RecommendationEngine:
 def recommend_for(
     state: DraftState,
     profiles: Mapping[int, ManagerProfile],
+    *,
+    board: UserBoard | None = None,
     **kwargs: Any,
 ) -> RecommendationSet:
     """Convenience wrapper: build an engine and ask it once.
@@ -711,7 +847,7 @@ def recommend_for(
     The engine is cheap to construct, so a caller that recommends only occasionally
     need not hold one.
     """
-    return RecommendationEngine(state, profiles).recommend(**kwargs)
+    return RecommendationEngine(state, profiles, board=board).recommend(**kwargs)
 
 
 __all__ = [

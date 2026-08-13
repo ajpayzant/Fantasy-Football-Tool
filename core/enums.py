@@ -212,6 +212,7 @@ class RecommendationLens(StrEnum):
     """Perspectives offered by the recommendation engine."""
 
     BEST_OVERALL = "best_overall"
+    YOUR_BOARD = "your_board"
     BEST_FIT = "best_roster_fit"
     BEST_VALUE = "best_value"
     SAFEST = "safest"
