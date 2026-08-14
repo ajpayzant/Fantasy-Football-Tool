@@ -1,9 +1,0 @@
-[server]
-# 8502, never 8501. The PLL BOSS Tool owns 8501, and its launcher treats
-# anything listening there as itself — so a mock draft on 8501 makes the BOSS
-# shortcut open the wrong app. Keep these two apart.
-port = 8502
-headless = true
-
-[browser]
-gatherUsageStats = false

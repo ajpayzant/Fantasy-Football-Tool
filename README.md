@@ -18,10 +18,14 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-The app is pinned to **port 8502** in `.streamlit/config.toml`, so `http://localhost:8502`
-is its address. On Windows, `launch_mock_draft.bat` (or `Fantasy Mock Draft.vbs`, which
-runs it without a console window) starts it and opens the browser, and does nothing but
-re-open the browser if it is already running.
+**Python 3.11 or newer** is required — `core/enums.py` and `core/freshness.py` use
+`enum.StrEnum`, which does not exist before 3.11. On 3.10 the app dies on its first import
+with `ImportError: cannot import name 'StrEnum'`.
+
+On Windows, `launch_mock_draft.bat` (or `Fantasy Mock Draft.vbs`, which runs it without a
+console window) starts the app on **port 8502** and opens the browser, and does nothing but
+re-open the browser if it is already running. The port lives in that launcher rather than
+in `.streamlit/config.toml`, deliberately — see the deployment note below.
 
 Then, in the app: **Setup → "Fetch current player data"** (one button). That pulls live
 rankings and ADP for the format you pick, joins the four sources into one board, and seats
@@ -37,6 +41,27 @@ python -m pytest tests -q          # 575 tests, ~100s, no network
 
 On Windows, prefix commands with `PYTHONIOENCODING=utf-8` — the console is cp1252 and
 some output contains non-ASCII characters.
+
+### Deploying to Streamlit Community Cloud
+
+Main file path is `app.py`, and under **Advanced settings** pick **Python 3.11 or newer**
+(3.12 or 3.13 is fine) for the reason above.
+
+**Do not commit `.streamlit/config.toml` with a `server.port` in it.** Cloud assigns the
+port itself; an app that binds to its own port instead never answers the health check, and
+Cloud reports a bare *"Error running app"* with nothing useful in the log. That file is
+gitignored here for exactly that reason, and the local port lives in
+`launch_mock_draft.bat`. If you want a bare `streamlit run app.py` to default to 8502
+locally, create the file yourself — it stays out of the repo:
+
+```toml
+[server]
+port = 8502
+```
+
+Nothing else about the app is deployment-specific: it writes its SQLite file into `data/`
+(which is why that directory is committed with a `.gitkeep`), reads no secrets, and needs
+no environment variables.
 
 ---
 

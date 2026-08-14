@@ -1,4 +1,5 @@
 # League-Aware Fantasy Football Mock Draft — runtime dependencies
+# Requires Python 3.11+ (enum.StrEnum).
 streamlit>=1.36
 pandas>=2.1
 numpy>=1.26

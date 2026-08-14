@@ -32,3 +32,10 @@ Thumbs.db
 .coverage
 htmlcov/
 .streamlit/secrets.toml
+
+# Local Streamlit config. Deliberately NOT committed: Streamlit Community Cloud
+# assigns the port itself, and a committed `server.port` makes the deployed app
+# bind to the wrong one, so it never answers the health check and Cloud reports a
+# bare "Error running app" with nothing in the log. The port belongs to
+# launch_mock_draft.bat, which passes it explicitly. See the README.
+.streamlit/config.toml
