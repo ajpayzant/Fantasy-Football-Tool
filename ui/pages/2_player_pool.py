@@ -896,15 +896,20 @@ with st.expander("Tier structure, and where tiers come from"):
     st.markdown(
         "No source publishes tiers, so these are derived here. Within each position, "
         "players are sorted by projection and the gap to the next player is measured. "
-        "A new tier starts wherever that gap is larger than the average gap **plus one "
-        "standard deviation** of all the gaps at that position — that is, wherever the "
-        "drop-off is unusual for that position rather than routine."
+        "A new tier starts wherever that gap is larger than the average gap **plus half "
+        "a standard deviation** — that is, wherever the drop-off is unusual rather than "
+        "routine. The gaps are measured only across the **draftable** part of the "
+        "position (half again as deep as the replacement rank your league shape "
+        "implies), because the long tail of near-identical projections would otherwise "
+        "drag the threshold below the real spacing between the players you actually "
+        "pick. Everyone past that window shares one replacement-level tier."
     )
     st.caption(
         "Two consequences worth knowing. Positions get different numbers of tiers, "
-        "because the threshold is computed per position rather than fixed. And tiers "
-        "move when your scoring does: change the scoring preset on **Setup** and the "
-        "projections shift, so the gaps — and the tier breaks — shift with them. "
+        "because both the threshold and the window are computed per position rather "
+        "than fixed. And tiers move when your scoring does: change the scoring preset "
+        "on **Setup** and the projections shift, so the gaps — and the tier breaks — "
+        "shift with them. "
         "Tiers group players the engine treats as near-interchangeable, and a tier "
         "about to empty out is what drives the 'last chance' recommendation lens."
     )

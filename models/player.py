@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Sequence
 
@@ -11,7 +12,11 @@ import pandas as pd
 from core import freshness as core_freshness
 from core import stats as core_stats
 from core.config import LeagueConfig, RosterSettings, ScoringRules
-from core.constants import SLOT_ELIGIBILITY, SLOT_FILL_PRIORITY
+from core.constants import (
+    REPLACEMENT_RANK_PER_TEAM,
+    SLOT_ELIGIBILITY,
+    SLOT_FILL_PRIORITY,
+)
 from core.enums import InjuryStatus, Position, ProjectionMode, RankingSource, Slot
 
 # Injury statuses that make a player undraftable-ish; scored as a penalty, not
@@ -57,6 +62,62 @@ GENERIC_PROJECTION_SOURCE = "Supplied by your source"
 STAT_LINE_PROJECTION_SOURCE = (
     "Computed from this player's projected stat line under your league's scoring rules"
 )
+
+# Per-slot decay applied to a projection estimate past the last projected player at a
+# position. 3% a slot: shallow enough that two hundred undrafted players do not collapse
+# onto one number, steep enough that every estimate stays under the last real one.
+_ESTIMATE_TAIL_DECAY = 0.97
+
+# Scale of last resort, used only for a board that projects nobody anywhere — there is
+# nothing to calibrate an estimate against, and the engine still needs a monotone number.
+_ESTIMATE_SCALE_TOP = 320.0
+_ESTIMATE_SCALE_BOTTOM = 20.0
+
+# How deep tiers are worth drawing, as a multiple of the position's replacement rank,
+# and the shallowest window worth measuring a gap distribution over.
+_TIER_WINDOW_MULTIPLE = 1.5
+_MIN_TIER_WINDOW = 8
+
+# Team count assumed when tiers are derived before a league has been applied. Matches
+# ``LeagueConfig.team_count``'s own default; applying a league re-derives them anyway.
+_ASSUMED_TEAM_COUNT = 12
+
+
+def _monotone_projection_curve(
+    group: Sequence[Player],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Board slot → projection, over the players in ``group`` a source did project.
+
+    ``group`` arrives in board order. The projections are sorted before being paired
+    with those slots, which forces the curve to decrease: real projections disagree
+    with the board here and there — a WR8 by ADP projected above the WR7 — and a curve
+    that wobbled would let an estimate read off it outrank a real projection above it.
+    ``None`` when nothing in ``group`` was projected.
+    """
+    slots = [index for index, player in enumerate(group) if player.projection is not None]
+    if not slots:
+        return None
+    values = sorted(
+        (float(player.projection) for player in group if player.projection is not None),
+        reverse=True,
+    )
+    return np.array(slots, dtype=float), np.array(values, dtype=float)
+
+
+def _estimate_from_curve(curve: tuple[np.ndarray, np.ndarray], slot: int) -> float:
+    """Read a projection estimate for the player at board slot ``slot``.
+
+    Interpolated between the nearest projected players either side of him, so the
+    estimate is bracketed by two real numbers rather than by a formula. Past the last
+    projected player the curve continues by a fixed decay per slot: continuing the
+    local slope instead goes negative on a long tail, and clamping to the last real
+    value would tie hundreds of undrafted players at one projection.
+    """
+    slots, values = curve
+    last = int(slots[-1])
+    if slot > last:
+        return float(values[-1]) * (_ESTIMATE_TAIL_DECAY ** (slot - last))
+    return float(np.interp(float(slot), slots, values))
 
 
 def _read_curve(slots: np.ndarray, curve: np.ndarray, at: float) -> float:
@@ -584,26 +645,14 @@ class PlayerPool:
         return outcome
 
     def _rederive_from_projections(self) -> None:
-        """Throw away everything read off the projection curve and derive it again.
+        """Re-derive everything that is read off the projection curve.
 
-        Called whenever projections move, by a scoring change or by an upload. Tiers
-        and outcome bands a *source* supplied are kept — they are identifiable by an
-        empty ``tier_source`` / ``outcome_band_source``, which is only ever written
-        when this app derived the value itself.
+        Called whenever projections move, by a scoring change or by an upload. Tiers,
+        bands and estimated projections this app derived are discarded and rebuilt on the
+        new scale; ones a *source* supplied are kept. Both of those happen in step 0 of
+        :meth:`_impute_core_fields`, which every branch below runs — the point of this
+        method is that a caller who moved a projection does not have to know that.
         """
-        for player in self._players:
-            if player.tier_source:
-                player.tier = None
-                player.tier_source = ""
-            if player.outcome_band_source:
-                # All three, not just the ones this app filled last time: ceiling, floor
-                # and risk are one statement about a player, and half of it on the old
-                # scoring scale would be worse than re-deriving all of it.
-                player.ceiling = None
-                player.floor = None
-                player.risk_score = None
-                player.outcome_band_source = ""
-
         if self.league is not None:
             self.apply_league(self.league)
         else:
@@ -717,6 +766,43 @@ class PlayerPool:
         def bump(store: dict[str, int], key: str) -> None:
             store[key] = store.get(key, 0) + 1
 
+        # 0. Throw away everything this app derived last time, to derive it again below.
+        #
+        # Projection estimates, tiers and outcome bands are all read off the curve of the
+        # *real* projections on the board, so they only mean anything on the scale those
+        # were on — and this method runs again every time that scale can have moved: a
+        # league applied, a scoring change, an upload, a saved board reloaded under
+        # different scoring rules. Values a *source* supplied are kept, and are told
+        # apart by their source line: this app's own estimate says so in
+        # ``projection_source``, and a derived tier or band always leaves a ``…_source``
+        # behind, which nothing else ever writes.
+        #
+        # Everything here used to be left in place, and both halves misfired. An
+        # estimated projection was mistaken for a real one — step 4 saw a player who
+        # already "had" a projection, cleared his ``projection_imputed`` flag, and from
+        # then on nothing could tell the difference, :meth:`rescore` included. And a
+        # derived tier survived reload, because :meth:`_assign_tiers` only fills tiers
+        # that are ``None``. Between them, a WR the board ranked 134th kept a 286-point
+        # estimate and a WR2 tier through every re-derivation the app could perform.
+        for player in self._players:
+            if (
+                player.projection is not None
+                and player.projection_source == IMPUTED_PROJECTION_SOURCE
+            ):
+                player.projection = None
+                player.expected_points = None
+            if player.tier_source:
+                player.tier = None
+                player.tier_source = ""
+            if player.outcome_band_source:
+                # All three, not just the ones filled last time: ceiling, floor and risk
+                # are one statement about a player, and half of it left on the old scale
+                # would be worse than re-deriving all of it.
+                player.ceiling = None
+                player.floor = None
+                player.risk_score = None
+                player.outcome_band_source = ""
+
         # 1. Overall rank: from ADP, else platform rank, else projection order.
         needs_rank = [p for p in self._players if p.overall_rank is None]
         if needs_rank:
@@ -763,28 +849,61 @@ class PlayerPool:
                     player.position_rank = index
                     bump(imputed, "position_rank")
 
-        # 4. Projection: monotone decreasing proxy from overall rank when absent.
-        have_projection = [p.projection for p in self._players if p.projection is not None]
-        if have_projection:
-            top = float(max(have_projection))
-            bottom = float(min(have_projection))
-        else:
-            top, bottom = 320.0, 20.0
-        n = max(1, len(self._players))
-        for player in self._players:
-            if player.projection is None:
-                rank = float(player.overall_rank or n)
-                fraction = min(1.0, max(0.0, (rank - 1.0) / max(1.0, n - 1.0)))
-                # Convex decay: elite players separate more than late-round ones.
-                player.projection = bottom + (top - bottom) * (1.0 - fraction) ** 1.8
+        # 4. Projection: for a player nobody projected, read the curve of real
+        #    projections *at his own position* at his own place on the board.
+        #
+        #    Half a live board arrives this way — 520 of 1003 players on a real ESPN
+        #    import — so where these land decides what the board looks like. The
+        #    estimate is bracketed by the real projections of the projected players
+        #    either side of him, which is the only thing an estimate can honestly claim:
+        #    a WR the board ranks 55th is worth about what the WRs ranked either side of
+        #    him are worth.
+        #
+        #    The previous version placed every player on one pool-wide curve by overall
+        #    rank, spanning the best projection in the pool to the worst. Two things
+        #    made that badly wrong. A position-blind range measures a WR against the
+        #    best quarterback, and a rank fraction over a thousand-player pool decays
+        #    far too slowly to be a projection: the 134th player came out at 77% of the
+        #    top of the range — 286 points, second among all WRs, ahead of Ja'Marr
+        #    Chase's real 277.
+        by_position_curve = {
+            position: _monotone_projection_curve(group)  # group is in board order
+            for position, group in by_position.items()
+        }
+        pool_order = sorted(
+            self._players,
+            key=lambda p: (p.overall_rank if p.overall_rank is not None else 1e9, p.name),
+        )
+        pool_curve = _monotone_projection_curve(pool_order)
+        pool_slots = {player.player_id: slot for slot, player in enumerate(pool_order)}
+        for position, group in by_position.items():
+            position_curve = by_position_curve[position]
+            for slot, player in enumerate(group):
+                if player.projection is not None:
+                    continue
+                if position_curve is not None:
+                    value = _estimate_from_curve(position_curve, slot)
+                elif pool_curve is not None:
+                    # Nobody at this position was projected — a board that supplies
+                    # skill positions only, say. The pool's own curve at least keeps
+                    # these players in the right order relative to everyone else.
+                    value = _estimate_from_curve(pool_curve, pool_slots[player.player_id])
+                else:
+                    fraction = slot / max(1.0, float(len(group) - 1))
+                    span = _ESTIMATE_SCALE_TOP - _ESTIMATE_SCALE_BOTTOM
+                    # Convex decay: elite players separate more than late-round ones.
+                    value = _ESTIMATE_SCALE_BOTTOM + span * (1.0 - fraction) ** 1.8
+                player.projection = round(float(value), 1)
                 bump(imputed, "projection")
                 player.projection_imputed = True
                 # Said plainly, because this is a restatement of draft position rather
                 # than an opinion about the player. A user comparing two projections
                 # needs to know when one of them is really just an ADP.
                 player.projection_source = IMPUTED_PROJECTION_SOURCE
-            else:
-                # Cleared, not left alone: a player who was imputed earlier and has
+
+        for player in self._players:
+            if player.projection_source != IMPUTED_PROJECTION_SOURCE:
+                # Cleared, not left alone: a player who was estimated earlier and has
                 # since been given a real projection is no longer an estimate, and a
                 # stale flag would make :meth:`rescore` discard the real number.
                 player.projection_imputed = False
@@ -803,14 +922,44 @@ class PlayerPool:
         self.metadata.imputed_fields = imputed
         self.metadata.missing_fields = missing
 
+    def _tier_window(self, position: Position) -> int:
+        """How deep at ``position`` a tier is worth drawing, in players.
+
+        One and a half times replacement level: past the point where a position's value
+        flattens, the players are interchangeable by definition, and one more tier
+        boundary drawn through them says something the board does not support.
+        """
+        if self.league is not None:
+            replacement = self.league.replacement_rank(position)
+        else:
+            replacement = max(
+                1.0,
+                REPLACEMENT_RANK_PER_TEAM.get(position, 1.0) * _ASSUMED_TEAM_COUNT,
+            )
+        return max(_MIN_TIER_WINDOW, int(math.ceil(replacement * _TIER_WINDOW_MULTIPLE)))
+
     def _assign_tiers(self, imputed: dict[str, int] | None = None) -> None:
         """Derive tiers from projection gaps for players lacking an explicit tier.
 
         Within a position, players are ordered by projection and a new tier starts
-        wherever the drop to the next player exceeds the mean gap plus one standard
-        deviation of all gaps at that position. So a tier break is a gap that is
-        genuinely unusual *for that position*, which is why QB tiers and WR tiers come
-        out different sizes rather than being forced to a fixed count.
+        wherever the drop to the next player is unusually large — measured over the
+        *draftable* stretch of that position, and set at half a standard deviation above
+        its mean gap. Everyone below that stretch shares one replacement-level tier.
+
+        The window is what makes the rule work, and its absence is what broke the
+        previous version. Gap statistics taken over a whole position are dominated by
+        its tail: 369 WRs on a live board are 300 of them projected within a point of
+        each other, which pulls the mean gap down to 0.8 points and sets the bar for a
+        tier break at 2.5 — below the 3-to-9-point spacing that separates elite WRs from
+        each other. Every WR worth drafting then broke into a tier of his own (tiers 1
+        through 11 were one player each) and the rest of the position landed in a single
+        blob of 244. Measured over the top 48 instead, the same rule breaks where the
+        position's real cliffs are: Nacua, then Chase, then Smith-Njigba with St. Brown,
+        then Lamb with Jefferson.
+
+        Tier *numbers* are read by the pick model as a strength signal (tier 1 scores
+        four times tier 4), not just displayed, so a position whose top is all
+        singletons does not merely look odd — it prices the players wrong.
         """
         by_position: dict[Position, list[Player]] = {}
         for player in self._players:
@@ -827,16 +976,22 @@ class PlayerPool:
                     player.tier = player.tier or 1
                 continue
             gaps = np.diff(values) * -1.0  # positive where value drops
-            threshold = float(np.mean(gaps) + np.std(gaps)) if len(gaps) else 0.0
+            window = min(self._tier_window(position), len(gaps))
+            inside = gaps[:window]
+            threshold = float(np.mean(inside) + 0.5 * np.std(inside))
             label = (
-                f"Projection gap breakpoints at {position}: a new tier starts where the "
-                f"drop to the next player exceeds {threshold:.1f} points "
-                f"(mean gap + 1σ)"
+                f"Projection gap breakpoints at {position}: across the top {window + 1} "
+                f"by projection, a new tier starts where the drop to the next player "
+                f"exceeds {threshold:.1f} points (mean gap + ½σ over that group); "
+                f"below them everyone shares one replacement-level tier"
             )
             tier = 1
             group[0].tier = group[0].tier or tier
             for index in range(1, len(group)):
-                if threshold > 0 and gaps[index - 1] > threshold:
+                if index <= window:
+                    if threshold > 0 and gaps[index - 1] > threshold:
+                        tier += 1
+                elif index == window + 1:
                     tier += 1
                 if group[index].tier is None:
                     group[index].tier = tier

@@ -208,10 +208,10 @@ def test_an_estimated_projection_is_re_derived() -> None:
     assert float(nobody.projection) != pytest.approx(estimated_before, abs=0.5), (
         "the estimate is unchanged, so it is still on the pre-rescore scale"
     )
-    real = [float(p.projection) for p in pool if p.stat_totals]
-    assert min(real) <= float(nobody.projection) <= max(real), (
-        "a re-derived estimate must land inside the range of the real projections "
-        "it is fitted to"
+    real = sorted((float(p.projection) for p in pool if p.stat_totals), reverse=True)
+    assert 0.0 < float(nobody.projection) < real[-1], (
+        "his ADP puts him behind every projected player on the board, so the curve he "
+        "is read off places him below the last of them — and still above zero"
     )
 
 
@@ -288,6 +288,51 @@ def test_derived_tiers_and_bands_are_re_derived() -> None:
     ]
     assert moved, "ceilings are in points, so they must move with the scoring scale"
     assert tiers_before  # kept for the diff a failure above would want
+
+
+def test_a_tier_this_app_derived_earlier_is_not_trusted_on_the_next_pass() -> None:
+    """The reload bug, and the reason a wrong tier could not be fixed by re-importing.
+
+    Tiers are saved to the database with the board and come back filled in, so a
+    derivation that only fills tiers which are ``None`` kept whatever the last one
+    produced — forever, through every rescore, upload and league change. A real board
+    reloaded that way had the best WR in tier 1 and the second best in tier 4, and
+    nothing the app could do would move them.
+    """
+    pool = _pool(STANDARD)
+    best = max(pool, key=lambda p: float(p.projection))
+    assert best.tier == 1 and best.tier_source, "fixture must have derived tiers"
+    best.tier = 17  # what a stale row from a previous derivation looks like
+
+    pool.rescore(STANDARD)
+
+    assert best.tier == 1, "a tier this app derived has to be re-derived, not believed"
+
+
+def test_re_deriving_an_unchanged_board_changes_nothing() -> None:
+    """Derivation is idempotent, which is what makes discarding-and-rebuilding safe.
+
+    Every estimate is fitted to the real projections around it, so an estimate left in
+    place and then treated as real on the next pass would let the board drift every time
+    it was opened — each generation of estimates fitted to the last one's output.
+    """
+    nobody = Player(
+        player_id="nobody", name="No Projection Anywhere", position=Position.WR,
+        overall_adp=200.0,
+    )
+    pool = _pool(STANDARD, extra=[nobody])
+
+    def snapshot() -> dict[str, tuple]:
+        return {
+            p.player_id: (p.projection, p.tier, p.ceiling, p.floor, p.risk_score)
+            for p in pool
+        }
+
+    before = snapshot()
+    pool.rescore(STANDARD)
+
+    assert snapshot() == before
+    assert nobody.projection_imputed, "and an estimate is still labelled as one"
 
 
 def test_a_supplied_tier_or_band_is_not_overwritten() -> None:

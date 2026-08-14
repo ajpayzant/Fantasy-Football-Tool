@@ -28,7 +28,7 @@ import os
 import pandas as pd
 import pytest
 
-from core.enums import ScoringPreset
+from core.enums import Position, ScoringPreset
 from services.providers import base as provider_base
 from services.providers import (
     ESPNProvider,
@@ -551,17 +551,8 @@ def test_import_projection_does_not_collide_on_aliased_columns(recorded, manifes
     assert not espn.equals(yahoo), "ESPN and Yahoo ADP must not be the same column"
 
 
-@requires_payloads
-def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> None:
-    """Ceiling, floor and risk must be present, ordered, and differentiated.
-
-    All three used to be blank for every player on a live board. The band is derived
-    from draft-pick disagreement mapped onto the position's projection curve, which
-    only means anything if three things hold: the band actually brackets the
-    projection (it is anchored on the player's own value), it is *not* constant (a
-    contested player has a wider one than a consensus player), and the paperwork
-    saying it was derived rather than supplied is filled in.
-    """
+def _live_pool(manifest):
+    """The board every source contributed to, imported as the app imports it."""
     from services.importers import import_player_pool
     from services.live import quick_league
 
@@ -581,6 +572,21 @@ def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> N
         source="live: recorded fixtures",
     ).pool
     assert pool is not None and len(pool) > 200
+    return pool
+
+
+@requires_payloads
+def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> None:
+    """Ceiling, floor and risk must be present, ordered, and differentiated.
+
+    All three used to be blank for every player on a live board. The band is derived
+    from draft-pick disagreement mapped onto the position's projection curve, which
+    only means anything if three things hold: the band actually brackets the
+    projection (it is anchored on the player's own value), it is *not* constant (a
+    contested player has a wider one than a consensus player), and the paperwork
+    saying it was derived rather than supplied is filled in.
+    """
+    pool = _live_pool(manifest)
 
     for player in pool:
         assert player.ceiling is not None, player.name
@@ -618,6 +624,89 @@ def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> N
     )
     estimated = [p for p in pool if "Estimated from draft position" in p.projection_source]
     assert all(not p.projection_detail for p in estimated)
+
+
+@requires_payloads
+def test_an_estimated_projection_never_outranks_a_real_one_above_it(
+    recorded, manifest
+) -> None:
+    """Half a live board arrives unprojected, and where the estimates land is the board.
+
+    ESPN projects a stat line for the players it thinks matter and nothing for the rest —
+    520 of 1003 players on a real import. Those 520 are estimated from where the board
+    ranks them, so the one invariant that has to hold is *ordering*: a player the board
+    ranks 134th cannot come out projected above a player it ranks 4th who carries a real
+    number. It used to, by a mile. Every player was placed on one pool-wide curve by
+    overall rank, spanning the best projection in the pool to the worst, and that curve
+    decays so slowly across a thousand players that the 134th came out at 77% of the top
+    of it — 286 points, second among all WRs, ahead of the real 277 of the WR ranked 4th.
+    """
+    pool = _live_pool(manifest)
+    estimated = [p for p in pool if p.projection_imputed]
+    assert len(estimated) > 20, f"only {len(estimated)} estimates — board too small"
+
+    for position in {p.position for p in estimated}:
+        group = sorted(
+            (p for p in pool if p.position is position),
+            key=lambda p: (p.overall_rank if p.overall_rank is not None else 1e9, p.name),
+        )
+        best_real_above: float | None = None
+        for player in group:
+            if not player.projection_imputed:
+                real = float(player.projection)
+                best_real_above = (
+                    real if best_real_above is None else max(best_real_above, real)
+                )
+                continue
+            assert best_real_above is None or player.projection <= best_real_above, (
+                f"{player.name} ({position}, board rank {player.overall_rank}) is "
+                f"estimated at {player.projection}, above a projected player ranked "
+                f"ahead of him"
+            )
+
+
+@requires_payloads
+def test_tiers_break_where_a_position_has_cliffs_rather_than_per_player(
+    recorded, manifest
+) -> None:
+    """A tier is a group. One tier per player at the top of a position is not one.
+
+    The rule reads gaps in the projection curve, and the statistics it read them against
+    used to be taken over the whole position — 369 WRs, 300 of them projected within a
+    point of each other, which pulled the mean gap to 0.8 points and put the bar for a
+    tier break below the ordinary 3-to-9-point spacing between elite WRs. WR tiers 1
+    through 11 came out one player each and the rest of the position landed in a single
+    tier of 244. Tier numbers are a strength signal the pick model reads, not decoration:
+    tier 1 scores four times tier 4, so that shape mispriced the entire top of the board.
+    """
+    pool = _live_pool(manifest)
+
+    for position in (Position.WR, Position.RB):
+        group = sorted(
+            (p for p in pool if p.position is position),
+            key=lambda p: -(p.projection or 0.0),
+        )
+        assert len(group) >= 50, f"{position}: only {len(group)} players"
+        tiers = [int(p.tier) for p in group]
+        assert tiers == sorted(tiers), f"{position}: tiers must not improve down the curve"
+        top = tiers[:12]
+        assert len(set(top)) <= 8, (
+            f"{position}: the top 12 span {len(set(top))} tiers — that is a ranking, "
+            f"not a set of tiers"
+        )
+        assert max(tiers) <= 12, f"{position}: {max(tiers)} tiers is a ranking too"
+        # The two halves of the same bug: an estimate that outran the real projections
+        # landed in a top tier, and a rank-134 WR in the WR2 tier is read by the pick
+        # model as a player to take in the second round.
+        top_three = [p for p in group if int(p.tier) <= 3]
+        assert not any(p.projection_imputed for p in top_three), (
+            f"{position}: "
+            + ", ".join(
+                f"{p.name} (tier {p.tier}, board rank {p.overall_rank})"
+                for p in top_three if p.projection_imputed
+            )
+            + " reached a top tier on an estimated projection"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
