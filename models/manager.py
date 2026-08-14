@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from core.config import ArchetypeParams, ShrinkageConfig, archetype_params
+from core.config import ArchetypeParams, archetype_params
 from core.enums import Archetype, Position, ProvenanceKind
 
 

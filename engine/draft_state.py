@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from core.config import LeagueConfig, SimulationConfig
 from core.enums import DraftStatus, Position, Slot

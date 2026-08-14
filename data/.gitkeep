@@ -1,0 +1,3 @@
+Keeps this directory in the repo. The SQLite database and the provider cache
+are written here at runtime and are both gitignored; SQLite will not create
+the directory itself.

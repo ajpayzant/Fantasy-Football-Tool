@@ -12,7 +12,6 @@ read and written as whole objects and their keys evolve with the model.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from contextlib import contextmanager
@@ -563,15 +562,6 @@ class ApplicationSettingRow(Base, TimestampMixin):
     value_json = Column(JSON, nullable=True)
 
 
-ALL_TABLES: tuple[str, ...] = (
-    "leagues", "league_roster_slots", "league_scoring_rules", "managers",
-    "manager_manual_preferences", "historical_drafts", "historical_picks",
-    "players", "player_data_sources", "player_rankings", "manager_profiles",
-    "mock_drafts", "mock_draft_picks", "mock_draft_rosters", "simulation_runs",
-    "simulation_results", "keepers", "application_settings",
-)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Engine / session management
 # ─────────────────────────────────────────────────────────────────────────────
@@ -765,33 +755,6 @@ def set_setting(session: Session, key: str, value: Any) -> None:
     else:
         row.value_text = None if value is None else str(value)
         row.value_json = None
-
-
-def reset_database(db_path: str | None = None) -> str:
-    """Drop and recreate every table. Destructive — the UI confirms first."""
-    engine = get_engine(db_path)
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    with session_scope(db_path) as session:
-        set_setting(session, "schema_version", SCHEMA_VERSION)
-    LOGGER.warning("Database reset at %s", database_path())
-    return database_path()
-
-
-def table_counts(db_path: str | None = None) -> dict[str, int]:
-    """Row counts per table, for the Settings page."""
-    engine = get_engine(db_path)
-    counts: dict[str, int] = {}
-    inspector = inspect(engine)
-    present = set(inspector.get_table_names())
-    with engine.connect() as connection:
-        for table in ALL_TABLES:
-            if table not in present:
-                counts[table] = 0
-                continue
-            result = connection.execute(text(f"SELECT COUNT(*) FROM {table}"))
-            counts[table] = int(result.scalar() or 0)
-    return counts
 
 
 def dispose_engine() -> None:

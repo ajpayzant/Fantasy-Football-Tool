@@ -18,10 +18,9 @@ from __future__ import annotations
 import bisect
 import logging
 from dataclasses import dataclass
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping, Sequence
 
 from core.config import ProfileEstimationConfig, RosterSettings
-from core.constants import SLOT_ELIGIBILITY, SLOT_FILL_PRIORITY
 from core.enums import Position, Slot
 from models.draft import DraftHistory, HistoricalDraft, HistoricalPick
 from models.player import PlayerPool, available_slot_for

@@ -9,7 +9,7 @@ the engine.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Iterable
+from typing import Any
 
 from .constants import (
     REPLACEMENT_RANK_PER_TEAM,
@@ -858,40 +858,6 @@ class AppPaths:
 DEFAULT_PATHS = AppPaths.default()
 
 
-def league_presets() -> dict[str, dict[str, Any]]:
-    """Convenience roster presets offered in the UI (fully editable after load)."""
-    return {
-        "Standard 1QB (12-team)": {
-            "slots": {Slot.QB: 1, Slot.RB: 2, Slot.WR: 2, Slot.TE: 1,
-                      Slot.FLEX: 1, Slot.K: 1, Slot.DST: 1, Slot.BENCH: 6},
-        },
-        "Superflex (12-team)": {
-            "slots": {Slot.QB: 1, Slot.RB: 2, Slot.WR: 2, Slot.TE: 1,
-                      Slot.FLEX: 1, Slot.SUPERFLEX: 1, Slot.BENCH: 7},
-        },
-        "Two-QB (12-team)": {
-            "slots": {Slot.QB: 2, Slot.RB: 2, Slot.WR: 3, Slot.TE: 1,
-                      Slot.FLEX: 1, Slot.BENCH: 7},
-        },
-        "3WR PPR (10-team)": {
-            "slots": {Slot.QB: 1, Slot.RB: 2, Slot.WR: 3, Slot.TE: 1,
-                      Slot.FLEX: 1, Slot.K: 1, Slot.DST: 1, Slot.BENCH: 6},
-        },
-        "No K/DST (12-team)": {
-            "slots": {Slot.QB: 1, Slot.RB: 2, Slot.WR: 3, Slot.TE: 1,
-                      Slot.FLEX: 2, Slot.BENCH: 7},
-        },
-    }
-
-
-def eligible_slots_for(position: Position, roster: RosterSettings) -> list[Slot]:
-    """Starting slots in this league that ``position`` can legally fill."""
-    return [
-        slot for slot in roster.ordered_starting_slots()
-        if position in SLOT_ELIGIBILITY.get(slot, frozenset())
-    ]
-
-
 def positions_in_use(roster: RosterSettings) -> set[Position]:
     """Positions worth drafting given the league's slot configuration."""
     used: set[Position] = set()
@@ -901,9 +867,3 @@ def positions_in_use(roster: RosterSettings) -> set[Position]:
     if not used:
         used = {Position.QB, Position.RB, Position.WR, Position.TE}
     return used
-
-
-def summarize_positions(positions: Iterable[Position]) -> str:
-    order = [Position.QB, Position.RB, Position.WR, Position.TE, Position.K, Position.DST]
-    present = [p for p in order if p in set(positions)]
-    return "/".join(str(p) for p in present)

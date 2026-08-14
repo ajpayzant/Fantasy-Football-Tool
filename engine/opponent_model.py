@@ -24,10 +24,9 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Sequence
+from typing import Mapping
 
 from core.config import (
-    LeagueConfig,
     ProfileEstimationConfig,
     ShrinkageConfig,
     SimulationConfig,
@@ -43,7 +42,6 @@ from models.manager import (
     Manager,
     ManagerPreferences,
     ManagerProfile,
-    apply_archetype_params,
     baseline_profile,
     normalize_manager_key,
     param_default,

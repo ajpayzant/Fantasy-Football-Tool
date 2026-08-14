@@ -142,15 +142,6 @@ class DraftStatus(StrEnum):
     COMPLETE = "complete"
 
 
-class DraftMode(StrEnum):
-    """How a mock draft is executed."""
-
-    INTERACTIVE = "interactive"
-    INSTANT = "instant"
-    MONTE_CARLO = "monte_carlo"
-    HISTORICAL_REPLAY = "historical_replay"
-
-
 class RankingSource(StrEnum):
     """Which ordering to use when scoring candidates."""
 

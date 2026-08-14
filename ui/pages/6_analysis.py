@@ -12,7 +12,6 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from core.enums import Position
 from models.database import session_scope
 from services.repository import (
     delete_mock_draft,

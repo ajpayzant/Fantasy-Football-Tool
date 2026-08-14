@@ -27,11 +27,11 @@ import math
 import random
 from dataclasses import dataclass, field
 from statistics import median
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Sequence
 
 from core.config import LeagueConfig, ModelWeights, SimulationConfig
 from core.constants import SLOT_ELIGIBILITY
-from core.enums import Position, RecommendationLens, Slot
+from core.enums import Position, Slot
 from engine.draft_state import DraftState, RunSnapshot
 from models.draft import TeamRoster
 from models.manager import ManagerProfile

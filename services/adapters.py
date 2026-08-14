@@ -19,7 +19,7 @@ import io
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Protocol
 
 import pandas as pd
 

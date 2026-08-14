@@ -18,6 +18,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+The app is pinned to **port 8502** in `.streamlit/config.toml`, so `http://localhost:8502`
+is its address. On Windows, `launch_mock_draft.bat` (or `Fantasy Mock Draft.vbs`, which
+runs it without a console window) starts it and opens the browser, and does nothing but
+re-open the browser if it is already running.
+
 Then, in the app: **Setup → "Fetch current player data"** (one button). That pulls live
 rankings and ADP for the format you pick, joins the four sources into one board, and seats
 generic opponents so you can draft immediately. Connect your Sleeper league ID on the same
@@ -27,7 +32,7 @@ point of the tool.
 To run the tests:
 
 ```bash
-python -m pytest tests -q          # 275 tests, ~38s, no network
+python -m pytest tests -q          # 575 tests, ~100s, no network
 ```
 
 On Windows, prefix commands with `PYTHONIOENCODING=utf-8` — the console is cp1252 and
@@ -178,11 +183,11 @@ errors rather than silently doing nothing.
 
 ```
 app.py                  Streamlit entry point: page registration, logging, schema init
-core/                   Enums, configuration dataclasses, validation, constants   (1,849 loc)
+core/                   Enums, configuration dataclasses, validation, constants   (2,685 loc)
   config.py               SimulationConfig, ModelWeights, ShrinkageConfig,
                           ProfileEstimationConfig, RosterSettings, ScoringRules
   validation.py           validate_league / ValidationReport / ConfigurationError
-engine/                 All simulation logic — never imports Streamlit           (4,964 loc)
+engine/                 All simulation logic — never imports Streamlit           (5,404 loc)
   draft_order.py          Snake / linear / third-round-reversal / custom orders
   draft_state.py          The mutable board: picks, rosters, availability
   features.py             Annotates picks with context (rank inversions, runs, fills)
@@ -190,24 +195,28 @@ engine/                 All simulation logic — never imports Streamlit        
   pick_model.py           Feature scoring and the softmax over candidates
   simulator.py            DraftSimulator, availability rollouts, monte_carlo_draft
   recommender.py          The eight lenses and their explanations
-models/                 SQLAlchemy schema and the domain objects                 (3,002 loc)
-services/               Import, normalisation, adapters, live providers, storage  (2,742 loc)
+models/                 SQLAlchemy schema and the domain objects                 (3,732 loc)
+services/               Import, normalisation, adapters, live providers, storage  (5,148 loc)
   live.py                 build_live_board: fetch → resolve → import → league
-  providers/              One module per source, plus the resolver               (2,491 loc)
+  providers/              One module per source, plus the resolver               (4,079 loc)
     base.py                 Fetch, disk cache, ProviderResult, failed_result
     sleeper.py              Player universe + the espn_id/yahoo_id crosswalk
     ffcalculator.py         Primary ADP, with published stdev/high/low
     espn.py / yahoo.py      Platform ranks and platform-population ADP
     leagues.py              Real league connectors (Sleeper ID; ESPN/Yahoo notes)
     resolver.py             The cross-source join and consensus merge
-ui/                     Streamlit only — imports the engine, never the reverse    (3,456 loc)
+ui/                     Streamlit only — imports the engine, never the reverse    (6,233 loc)
   state.py                Typed session-state accessors with cache invalidation
   components.py           Shared rendering: banners, gating, charts, flash messages
   pages/1..7_*.py         The seven pages
-scripts/                record_live_fixtures.py, check_sample_archetypes.py
-tests/                  275 tests, no network                                    (5,672 loc)
+scripts/                Developer diagnostics, none of them imported by the app
+  record_live_fixtures.py   Re-record the provider payloads the offline tests replay
+  check_sample_archetypes.py  Recover all 12 designed archetypes from picks alone
+  diagnose_picks.py         Reach report: which utility term drove each early pick
+  diagnose_early_rounds.py  Round-by-round spread of picks against consensus ADP
+tests/                  575 tests, no network                                   (10,230 loc)
   fixtures/sample_league/  The synthetic league — test-only, unreachable from app (1,443 loc)
-  fixtures/live_payloads/  Recorded real provider responses, trimmed  (16 files, 2.7 MB)
+  fixtures/live_payloads/  Recorded real provider responses, trimmed  (17 files, 2.8 MB)
 ```
 
 **The one architectural rule:** the engine never imports Streamlit. `ui/` depends on
@@ -275,8 +284,8 @@ Settings → System). Deleting it resets the app to empty.
   post-draft analysis, all from the UI.
 - Persistence for leagues, player pools, draft history, manager profiles, saved mocks and
   simulation runs.
-- 275 tests passing with no network access, including 35 headless page tests via
-  `streamlit.testing.v1.AppTest` that render every page with real engine objects, and 19
+- 575 tests passing with no network access, including 95 headless page tests via
+  `streamlit.testing.v1.AppTest` that render every page with real engine objects, and 44
   provider/resolver tests run against recorded real payloads.
 
 **Deliberately not implemented** (the spec prioritised a reliable redraft snake experience
@@ -295,17 +304,13 @@ over partial advanced features):
 
 **Known rough edges worth a decision:**
 
-1. `pages/` (top level) and `analytics/` are empty leftovers. The empty top-level `pages/`
-   is a mild hazard: Streamlit auto-discovers that directory, so a file dropped in it would
-   appear in navigation alongside the explicit `st.navigation` list. Both are candidates
-   for deletion.
-2. Settings are session-scoped, not persisted. A browser reload returns to the defaults in
+1. Settings are session-scoped, not persisted. A browser reload returns to the defaults in
    `core/config.py`. The `settings` table exists and `read_setting`/`write_setting` are
    implemented, so wiring this up is small.
-3. Monte Carlo runs are single-threaded. A 500-run full-draft simulation takes real time.
+2. Monte Carlo runs are single-threaded. A 500-run full-draft simulation takes real time.
    The engine is pure Python with no shared mutable state across runs, so this parallelises
    cleanly if it becomes annoying.
-4. The recommendation lenses are not weighted against each other — the app shows all eight
+3. The recommendation lenses are not weighted against each other — the app shows all eight
    and flags agreement rather than producing one ranked answer. That was deliberate, but it
    is the main thing to reconsider if the page feels like too much to read at pick speed.
 
