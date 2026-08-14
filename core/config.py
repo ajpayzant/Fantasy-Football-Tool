@@ -401,6 +401,16 @@ class ModelWeights:
     it lost to a 0.6 value edge and rosters finished with unfilled K/DST seats.
     """
     positional_limit_penalty: float = 0.80
+    premature_kicker_penalty: float = 1.50
+    """Cost of taking a kicker or defence early, at its full round-one strength.
+
+    The one thing every drafter in every league agrees on. Nothing else in the model
+    expresses it: a kicker's ADP is the only thing holding him back, and on a blended
+    board that ADP can read as round nine in a ten-team league, so a manager whose
+    starters were full would take one in round five about once every four drafts. The
+    penalty fades to nothing over the last few rounds, where taking one is correct, and
+    the roster-imbalance penalty still guarantees the seat gets filled before the end.
+    """
 
     def to_dict(self) -> dict[str, float]:
         return {f: float(getattr(self, f)) for f in self.__slots__}
@@ -568,6 +578,18 @@ class SimulationConfig:
     """Softmax temperature at average predictability."""
     temperature_range: tuple[float, float] = (0.22, 1.35)
     """Clamp for per-manager temperature (predictable → volatile)."""
+    early_round_temperature: float = 0.55
+    """Temperature multiplier in round 1, easing to 1.0 by ``early_round_rounds``.
+
+    Rounds 1-3 of a real draft barely deviate from consensus: the crowd's top twelve
+    are the top twelve, and a manager who deviates does it by one or two slots, not by
+    ten. Later on the same manager is genuinely making it up — the board is flat, the
+    rankings disagree with each other, and personal preference is most of the decision.
+    One temperature for the whole draft cannot say both things, so the early rounds get
+    a colder one.
+    """
+    early_round_rounds: int = 4
+    """Round by which the early-round temperature discount is fully gone."""
     candidate_pool_size: int = 40
     """How many top-utility players enter the softmax. Keeps sims fast."""
     adp_sigma_floor: float = 6.0
@@ -583,10 +605,21 @@ class SimulationConfig:
     """ADP delta (picks) treated as one unit of 'reach' when scoring utility."""
     random_seed: int | None = None
 
-    def temperature_for(self, predictability: float) -> float:
+    def temperature_for(
+        self, predictability: float, round_number: int | None = None
+    ) -> float:
         """Map predictability in [0, 1] to a softmax temperature.
 
         Higher predictability → lower temperature → more deterministic picks.
+
+        ``round_number`` applies the early-round discount described on
+        :attr:`early_round_temperature`, interpolating linearly back to no discount by
+        :attr:`early_round_rounds`. Omitting it asks for the manager's baseline
+        temperature, which is what the settings preview and the profile displays want.
+
+        The discount is applied *after* the range clamp, deliberately: the clamp bounds
+        how volatile a manager can be over a draft, and a very predictable manager in
+        round 1 is allowed to be more deterministic than that floor.
         """
         lo, hi = self.temperature_range
         p = min(1.0, max(0.0, float(predictability)))
@@ -595,7 +628,19 @@ class SimulationConfig:
             t = lo + (self.base_temperature - lo) * ((1.0 - p) / 0.5)
         else:
             t = self.base_temperature + (hi - self.base_temperature) * ((0.5 - p) / 0.5)
-        return float(min(hi, max(lo, t)))
+        return float(min(hi, max(lo, t))) * self.round_temperature_factor(round_number)
+
+    def round_temperature_factor(self, round_number: int | None) -> float:
+        """How much of the early-round temperature discount applies in this round."""
+        if round_number is None:
+            return 1.0
+        rounds = int(self.early_round_rounds)
+        start = float(self.early_round_temperature)
+        r = max(1, int(round_number))
+        if rounds <= 1 or r >= rounds:
+            return 1.0
+        progress = float(r - 1) / float(rounds - 1)
+        return float(start + (1.0 - start) * progress)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -606,6 +651,8 @@ class SimulationConfig:
             "blend_weights": dict(self.blend_weights),
             "base_temperature": self.base_temperature,
             "temperature_range": list(self.temperature_range),
+            "early_round_temperature": self.early_round_temperature,
+            "early_round_rounds": self.early_round_rounds,
             "candidate_pool_size": self.candidate_pool_size,
             "adp_sigma_floor": self.adp_sigma_floor,
             "adp_sigma_round_growth": self.adp_sigma_round_growth,
@@ -628,12 +675,12 @@ class SimulationConfig:
             blend_weights=dict(raw.get("blend_weights") or {
                 "platform_adp": 0.45, "overall_adp": 0.25, "projection": 0.30}),
         )
-        for key in ("base_temperature", "adp_sigma_floor", "adp_sigma_round_growth",
-                    "reach_scale_picks"):
+        for key in ("base_temperature", "early_round_temperature", "adp_sigma_floor",
+                    "adp_sigma_round_growth", "reach_scale_picks"):
             if key in raw:
                 setattr(cfg, key, float(raw[key]))
-        for key in ("candidate_pool_size", "availability_simulations",
-                    "monte_carlo_default_runs"):
+        for key in ("early_round_rounds", "candidate_pool_size",
+                    "availability_simulations", "monte_carlo_default_runs"):
             if key in raw:
                 setattr(cfg, key, int(raw[key]))
         if raw.get("temperature_range"):

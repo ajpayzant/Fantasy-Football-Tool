@@ -407,7 +407,7 @@ class DraftSimulator:
         context = context_for(self.state, profile, draft_slot=target, rng=self.rng)
         ranked = score_candidates(context)
         temperature = self.state.settings.temperature_for(
-            float(profile.get("predictability"))
+            float(profile.get("predictability")), context.round_number
         )
         return pick_probabilities(ranked, temperature)
 
@@ -939,7 +939,7 @@ def upcoming_position_pressure(
         if not ranked:
             continue
         temperature = state.settings.temperature_for(
-            float(profile.get("predictability"))
+            float(profile.get("predictability")), context.round_number
         )
         pick_probabilities(ranked, temperature)
         for position, probability in position_probabilities(ranked).items():
@@ -974,7 +974,7 @@ def likely_next_picks(
         if not ranked:
             continue
         temperature = state.settings.temperature_for(
-            float(profile.get("predictability"))
+            float(profile.get("predictability")), context.round_number
         )
         pick_probabilities(ranked, temperature)
         best = ranked[0]

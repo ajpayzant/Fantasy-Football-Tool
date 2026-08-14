@@ -76,6 +76,9 @@ WEIGHT_HELP: dict[str, str] = {
     "roster_imbalance_penalty": "Penalty for stacking one position while others are "
                                 "empty.",
     "positional_limit_penalty": "Penalty for exceeding a sensible cap at a position.",
+    "premature_kicker_penalty": "Penalty for taking a kicker or defence before the last "
+                                "few rounds. Zero lets a blended board's kicker ADP put "
+                                "one in round five.",
 }
 
 ESTIMATION_HELP: dict[str, str] = {
@@ -170,6 +173,18 @@ with sim_tab:
         help="The band the per-manager temperature is clamped into. The most "
              "predictable manager gets the low end, the most erratic the high end.",
     )
+    early_round_temperature = sim_columns[0].slider(
+        "Round-1 temperature multiplier", 0.1, 1.0,
+        float(settings.early_round_temperature), 0.05,
+        help="How much colder round 1 is than the same manager's baseline. The top of "
+             "a real draft barely deviates from consensus; 1.0 removes the distinction.",
+    )
+    early_round_rounds = sim_columns[1].number_input(
+        "Rounds the discount covers", min_value=1, max_value=16,
+        value=int(settings.early_round_rounds), step=1,
+        help="The round by which that discount has eased away entirely, restoring full "
+             "variance for the middle and late rounds.",
+    )
     candidate_pool_size = sim_columns[0].number_input(
         "Candidate pool size", min_value=5, max_value=200,
         value=int(settings.candidate_pool_size),
@@ -243,16 +258,20 @@ with sim_tab:
     st.markdown("**Temperature curve**")
     st.caption(
         "The mapping from a manager's estimated predictability to their pick "
-        "temperature, under the values above. This is how a profile becomes behaviour."
+        "temperature, under the values above. This is how a profile becomes behaviour. "
+        "The round-1 line is the same curve under the early-round discount."
     )
     preview = SimulationConfig(
         base_temperature=float(base_temperature),
         temperature_range=(float(temperature_low), float(temperature_high)),
+        early_round_temperature=float(early_round_temperature),
+        early_round_rounds=int(early_round_rounds),
     )
     st.line_chart(
         pd.DataFrame({
             "predictability": [i / 20 for i in range(21)],
-            "temperature": [preview.temperature_for(i / 20) for i in range(21)],
+            "round 1": [preview.temperature_for(i / 20, 1) for i in range(21)],
+            "round 4+": [preview.temperature_for(i / 20) for i in range(21)],
         }).set_index("predictability"),
         height=220,
     )
@@ -330,6 +349,8 @@ if apply_columns[0].button("Apply settings", type="primary", width="stretch"):
         blend_weights=blend_weights,
         base_temperature=float(base_temperature),
         temperature_range=(float(temperature_low), float(temperature_high)),
+        early_round_temperature=float(early_round_temperature),
+        early_round_rounds=int(early_round_rounds),
         candidate_pool_size=int(candidate_pool_size),
         adp_sigma_floor=float(adp_sigma_floor),
         adp_sigma_round_growth=float(adp_sigma_round_growth),

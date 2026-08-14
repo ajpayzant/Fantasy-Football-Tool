@@ -13,6 +13,7 @@ during development:
 
 from __future__ import annotations
 
+import dataclasses
 import random
 
 import pytest
@@ -245,15 +246,21 @@ class TestValueScalesToTheDraftNotTheFile:
     weight could separate them. Round one filled with fifth-round players.
     """
 
-    def test_the_adp_span_follows_the_draft_length(
-        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    def test_the_adp_span_follows_the_round_not_the_file(
+        self, state: DraftState, profiles: dict[int, ManagerProfile],
+        settings: SimulationConfig,
     ) -> None:
+        """A fixed reach costs more in round 1 than the same reach in round 8."""
         context = context_for(state, profiles[1])
-        assert context.value_span == pytest.approx(
-            max(24.0, 0.25 * context.config.total_picks)
-        )
-        # And is not a function of how many players the file happened to carry.
-        assert context.value_span < 0.25 * len(state.pool)
+        player = _player("reacher", Position.RB, context.overall_pick + 20.0)
+        early = score_candidate(player, context).components["adp_value"]
+        late = score_candidate(
+            player, dataclasses.replace(context, round_number=8, view=None)
+        ).components["adp_value"]
+        assert early < late < 0.0
+        # Two sigma of the round's own spread is the span, so 20 picks early in round 1
+        # is a touch under two sigma of six.
+        assert early == pytest.approx(-20.0 / (2.0 * settings.adp_sigma_floor))
 
     def test_a_bigger_file_does_not_change_the_score(
         self, smoke_league: tuple[LeagueConfig, PlayerPool, League],
@@ -310,13 +317,35 @@ class TestValueScalesToTheDraftNotTheFile:
         from roster need, and kickers came off the board in round one.
         """
         context = context_for(state, profiles[1])
-        span = context.value_span
+        span = 2.0 * context.settings.adp_sigma_floor
         bad = _player("bad", Position.RB, context.overall_pick + span * 1.5)
         worse = _player("worse", Position.RB, context.overall_pick + span * 2.5)
         bad_value = score_candidate(bad, context).components["adp_value"]
         worse_value = score_candidate(worse, context).components["adp_value"]
         assert bad_value < -1.0
         assert worse_value < bad_value
+
+    def test_a_wide_market_spread_does_not_buy_an_early_round_pass(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Regression: a kicker's 23-pick ADP spread bought him a 46-pick span.
+
+        Taken at face value it put Brandon Aubrey in round three of a live mock. The
+        value term uses the tighter of the player's spread and the round's, so a wide
+        one cannot forgive an early reach — while :func:`adp_availability`, which asks
+        the different question of where he will actually go, still honours it.
+        """
+        context = context_for(state, profiles[1])
+        adp = context.overall_pick + 24.0
+        settled = _player("settled", Position.RB, adp, adp_stdev=2.0)
+        divisive = _player("divisive", Position.RB, adp, adp_stdev=23.0)
+        assert (
+            score_candidate(divisive, context).components["adp_value"]
+            == pytest.approx(score_candidate(settled, context).components["adp_value"])
+        )
+        assert adp_availability(
+            divisive, context.overall_pick, context.settings, 1
+        ) > adp_availability(settled, context.overall_pick, context.settings, 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +548,110 @@ class TestPredictabilityOrdersDecisiveness:
         )
         assert scored[0].probability < 0.999
         assert scored[1].probability > 0.0
+
+
+class TestEarlyRoundsAreColderThanLateOnes:
+    """The first two rounds of a real draft barely deviate from consensus.
+
+    Regression: one temperature for the whole draft made round one as loose as round
+    twelve. Jaxon Smith-Njigba went first overall and Drake London — ranked 14th — went
+    second, in a room where the top two were not close to being in doubt.
+    """
+
+    def test_round_one_is_colder_than_the_middle_rounds(
+        self, settings: SimulationConfig
+    ) -> None:
+        assert settings.temperature_for(0.6, 1) < settings.temperature_for(0.6, 2)
+        assert settings.temperature_for(0.6, 2) < settings.temperature_for(0.6, 4)
+
+    def test_the_discount_is_gone_by_the_middle_of_the_draft(
+        self, settings: SimulationConfig
+    ) -> None:
+        baseline = settings.temperature_for(0.6)
+        assert settings.temperature_for(0.6, settings.early_round_rounds) == pytest.approx(baseline)
+        assert settings.temperature_for(0.6, 12) == pytest.approx(baseline)
+        # Omitting the round asks for the manager's own temperature, undiscounted.
+        assert settings.temperature_for(0.6, 1) < baseline
+
+    def test_ordering_by_predictability_survives_the_discount(
+        self, settings: SimulationConfig
+    ) -> None:
+        """The discount must scale the curve, not flatten the managers together."""
+        assert settings.temperature_for(0.9, 1) < settings.temperature_for(0.2, 1)
+
+    def test_a_consensus_top_pick_dominates_the_first_overall_pick(
+        self, state: DraftState, profiles: dict[int, ManagerProfile],
+        settings: SimulationConfig,
+    ) -> None:
+        """Most of the probability at pick 1 must sit on the top few by ADP."""
+        context = context_for(state, profiles[1])
+        predictability = float(profiles[1].get("predictability"))
+        top = {
+            p.player_id for p in sorted(
+                (p for p in state.pool.players if p.adp_for() is not None),
+                key=lambda p: p.adp_for(),
+            )[:5]
+        }
+
+        def share(round_number: int | None) -> float:
+            ranked = pick_probabilities(
+                score_candidates(context),
+                settings.temperature_for(predictability, round_number),
+            )
+            return sum(c.probability for c in ranked if c.player.player_id in top)
+
+        assert share(1) > 0.5
+        # And the discount is what puts it there.
+        assert share(1) > share(None)
+
+
+class TestKickersAndDefencesWaitForTheEnd:
+    """Nothing else in the model expresses the one convention every league keeps.
+
+    A blended board can read a kicker's ADP as round nine of a ten-team draft, and with
+    ADP the only thing holding him back one went in round five about every fourth draft.
+    """
+
+    def test_the_penalty_fades_as_the_draft_runs_out(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        context = context_for(state, profiles[1])
+        kicker = _player("k", Position.K, 90.0)
+        rounds = context.config.rounds
+        early = score_candidate(kicker, context).components["premature_kicker_penalty"]
+        middle = score_candidate(
+            kicker, dataclasses.replace(context, round_number=rounds // 2, view=None)
+        ).components["premature_kicker_penalty"]
+        last = score_candidate(
+            kicker, dataclasses.replace(context, round_number=rounds, view=None)
+        ).components["premature_kicker_penalty"]
+        assert early < middle < 0.0
+        assert last == 0.0
+
+    def test_only_kickers_and_defences_pay_it(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        context = context_for(state, profiles[1])
+        for position in (Position.QB, Position.RB, Position.WR, Position.TE):
+            player = _player(f"p-{position}", position, 90.0)
+            assert score_candidate(
+                player, context
+            ).components["premature_kicker_penalty"] == 0.0
+        for position in (Position.K, Position.DST):
+            player = _player(f"p-{position}", position, 90.0)
+            assert score_candidate(
+                player, context
+            ).components["premature_kicker_penalty"] < 0.0
+
+    def test_a_round_one_kicker_loses_to_a_comparable_skill_player(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Same ADP, same round: the kicker must not be the pick."""
+        context = context_for(state, profiles[1])
+        adp = float(context.overall_pick)
+        kicker = score_candidate(_player("k", Position.K, adp), context)
+        back = score_candidate(_player("rb", Position.RB, adp), context)
+        assert kicker.utility < back.utility
 
 
 # ─────────────────────────────────────────────────────────────────────────────

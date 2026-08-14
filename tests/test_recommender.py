@@ -552,11 +552,19 @@ class TestDistributionLenses:
     ) -> None:
         """Four starters on one bye is a week with half the lineup out."""
         simulator = DraftSimulator(state, profiles)
-        for _ in range(BYE_STACK_WARNING):
+        # One player per distinct starting slot, so all four really are starters. Taking
+        # the best available four times over left that to chance: whenever two of them
+        # shared a position the second went to the bench, where a bye warns about
+        # nothing, and the test then depended on how the room happened to draft.
+        slots = (Position.QB, Position.RB, Position.WR, Position.TE)
+        assert len(slots) >= BYE_STACK_WARNING
+        for position in slots:
             simulator.simulate_until_user()
             if state.is_complete:
                 break
-            player = state.best_available()
+            player = next(
+                p for p in state.available_players() if p.position is position
+            )
             player.bye_week = 9
             state.make_pick(player, is_user_pick=True)
         simulator.simulate_until_user()

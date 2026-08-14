@@ -79,7 +79,9 @@ def main() -> None:
             context = context_for(state, profile, rng=sim.rng)
             ranked = pick_probabilities(
                 score_candidates(context),
-                state.settings.temperature_for(float(profile.get("predictability"))),
+                state.settings.temperature_for(
+                    float(profile.get("predictability")), context.round_number
+                ),
             )
             top_prob.append(ranked[0].probability if ranked else 0.0)
             if ranked:
@@ -89,7 +91,7 @@ def main() -> None:
                                 best - min(utilities)))
                 temperatures.append(
                     state.settings.temperature_for(
-                        float(profile.get("predictability"))
+                        float(profile.get("predictability")), context.round_number
                     )
                 )
             made = sim.simulate_pick()

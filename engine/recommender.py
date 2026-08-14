@@ -409,7 +409,7 @@ class RecommendationEngine:
         if not ranked:
             return [], []
         temperature = self.state.settings.temperature_for(
-            float(context.profile.get("predictability"))
+            float(context.profile.get("predictability")), context.round_number
         )
         pick_probabilities(ranked, temperature)
         if self.board.is_empty:

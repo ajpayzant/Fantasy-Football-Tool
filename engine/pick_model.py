@@ -53,20 +53,35 @@ demand: only a fraction of the league is realistically shopping at a position at
 any one pick.
 """
 
-VALUE_SPAN_FRACTION: float = 0.25
-"""Fraction of *the draft* over which ADP value is normalised to +/-1.
+VALUE_SPAN_SIGMAS: float = 2.0
+"""ADP standard deviations over which the value term spans +/-1.
 
-Of the draft — team count times rounds — and deliberately not of the player file.
-Normalising on the file made every value term a function of how many players the
-importer happened to load: a 1,000-player board gave a 250-pick span, so passing on the
-consensus number-one to take someone 45 picks early cost 0.18 utility while a positional
-tendency was worth 0.60. The model would take a fifth-round running back at pick five and
-the arithmetic said that was fine. The draft's length is the honest denominator, because
-that is the range a pick can actually be wrong by.
+The denominator for "how far off ADP is this pick" has to be the market's own
+uncertainty about the player, not a constant. A quarter of the draft — the previous
+rule — was the same 40 picks in round 1 as in round 14, and 40 picks is the whole top
+of the board early and barely two rounds late. Priced that way, taking the WR8 first
+overall cost 0.45 utility, which a positional tendency worth 0.60 could simply outvote:
+Drake London went second overall in a live mock.
+
+:func:`adp_sigma` already models that uncertainty and already grows with the round —
+about 6 picks in round 1, 17 by round 8, 30 by round 16 — so the value term becomes a
+z-score: how many standard deviations early is this? Two sigma is the span, so a
+two-sigma reach costs a full point. That makes the first two rounds track consensus
+closely (an ADP-19 player at pick 2 now costs 1.4, which nothing outbids) while leaving
+the late rounds as loose as they really are. It also inherits a player's own
+``adp_stdev`` when the file supplies one, so a rookie the platforms genuinely disagree
+about gets the wider tolerance he deserves and a settled top-five pick does not.
+
+The span is the *tighter* of the player's own spread and the round's, because inheriting
+a supplied spread is right only up to a point and kickers are where it stops being right.
+This board has Brandon Aubrey at ADP 84.5 with a spread of 22.9 and a platform rank of
+251 — that spread is not a market which thinks he might go at pick 60, it is an average
+over boards that disagree about whether he is draftable at all, and taken at face value
+it bought him a 46-pick span and a place in round three. Only the value term takes the
+tighter figure. :func:`adp_availability` and :func:`expected_survival` keep the honest
+one, because they ask where a player will *actually* go and a player the boards disagree
+about really is harder to predict.
 """
-
-MIN_VALUE_SPAN_PICKS: float = 24.0
-"""Floor for that span, so a two-round test draft does not make every pick extreme."""
 
 BOARD_HORIZON_SLACK: float = 1.25
 """Board depth graded by the value terms, as a multiple of the picks in the draft.
@@ -190,20 +205,29 @@ class ScoredCandidate:
 # ─────────────────────────────────────────────────────────────────────────────
 # ADP as a distribution
 # ─────────────────────────────────────────────────────────────────────────────
+def baseline_adp_sigma(round_number: int, settings: SimulationConfig) -> float:
+    """The round's own ADP spread, before any player-specific number.
+
+    Grows with the round: consensus is tight at the top of the draft and wide by the
+    double-digit rounds, where a player's range spans whole rounds.
+    """
+    growth = float(settings.adp_sigma_round_growth) * max(0, int(round_number) - 1)
+    return float(settings.adp_sigma_floor) + growth
+
+
 def adp_sigma(
     player: Player, round_number: int, settings: SimulationConfig
 ) -> float:
     """Standard deviation of a player's likely draft slot, in picks.
 
-    Uses the player file's own ``adp_stdev`` when present. Otherwise it grows
-    with the round: consensus is tight at the top of the draft and wide by the
-    double-digit rounds, where a player's range spans whole rounds.
+    Uses the player file's own ``adp_stdev`` when present, floored so a consensus ADP is
+    never treated as a certainty. Otherwise it falls back to
+    :func:`baseline_adp_sigma`.
     """
     supplied = player.adp_stdev
     if supplied is not None and float(supplied) > 0:
         return max(float(settings.adp_sigma_floor), float(supplied))
-    growth = float(settings.adp_sigma_round_growth) * max(0, int(round_number) - 1)
-    return float(settings.adp_sigma_floor) + growth
+    return baseline_adp_sigma(round_number, settings)
 
 
 def adp_availability(
@@ -261,7 +285,12 @@ def expected_survival(
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility terms
 # ─────────────────────────────────────────────────────────────────────────────
-def _value_term(player: Player, overall_pick: int, span: float) -> float:
+def _value_term(
+    player: Player,
+    overall_pick: int,
+    settings: SimulationConfig,
+    round_number: int,
+) -> float:
     """Positive when a player has fallen past his ADP, negative when reaching.
 
     ``pick - adp``: a player who *fell* is still on the board later than the crowd
@@ -276,15 +305,20 @@ def _value_term(player: Player, overall_pick: int, span: float) -> float:
     this manager reach?", while this term asks "how much value is on the table?".
     Conflating the two is what produced the original inversion.
 
-    Scaled by ``span`` — a quarter of the draft, from
-    :data:`VALUE_SPAN_FRACTION` — so it means the same thing whether the player file
-    held 300 names or 3,000. Bargains cap at +1; reaches run to
+    Measured in the player's own ADP standard deviations — see
+    :data:`VALUE_SPAN_SIGMAS` — so it is strict where consensus is tight (the first two
+    rounds) and forgiving where it is not (the last ten), and independent of how many
+    names the player file happened to hold. Bargains cap at +1; reaches run to
     :data:`MAX_REACH_PENALTY`, for the reason given there.
     """
     adp = player.adp_for()
     if adp is None:
         return 0.0
-    span = max(1.0, float(span))
+    sigma = min(
+        adp_sigma(player, round_number, settings),
+        baseline_adp_sigma(round_number, settings),
+    )
+    span = max(1.0, VALUE_SPAN_SIGMAS * sigma)
     value = (float(overall_pick) - float(adp)) / span
     return float(max(-MAX_REACH_PENALTY, min(1.0, value)))
 
@@ -675,6 +709,34 @@ def _limit_penalty(player: Player, roster: TeamRoster) -> float:
     return 1.0 if roster.at_position_limit(player.position) else 0.0
 
 
+LATE_ROUND_POSITIONS: frozenset[Position] = frozenset({Position.K, Position.DST})
+"""Positions that real drafts leave until the end, near-universally."""
+
+LATE_ROUND_GRACE: int = 3
+"""Rounds at the end of a draft where taking a kicker or defence is simply normal."""
+
+
+def _premature_penalty(
+    player: Player, round_number: int, config: LeagueConfig
+) -> float:
+    """How out of place a kicker or defence is this early, from 1.0 down to 0.
+
+    Full strength in round one and fading linearly to nothing over the last
+    :data:`LATE_ROUND_GRACE` rounds. Graded rather than a cutoff because the convention
+    is itself graded: round twelve is early for a kicker and round three is absurd, and
+    a flag cannot say both. Every other position returns 0 and is unaffected.
+    """
+    if player.position not in LATE_ROUND_POSITIONS:
+        return 0.0
+    rounds = max(1, int(config.rounds))
+    # The first round where taking one is unremarkable.
+    normal_from = max(2, rounds - int(LATE_ROUND_GRACE) + 1)
+    current = max(1, int(round_number))
+    if current >= normal_from:
+        return 0.0
+    return float(normal_from - current) / float(normal_from - 1)
+
+
 def _imbalance_penalty(
     player: Player,
     roster: TeamRoster,
@@ -744,22 +806,17 @@ class PickContext:
     """Board depth the value terms grade against — see :data:`BOARD_HORIZON_SLACK`.
     Derived in ``__post_init__`` when left at 0, which is every real caller."""
 
-    value_span: float = 0.0
-    """Picks over which ADP value spans +/-1 — see :data:`VALUE_SPAN_FRACTION`."""
-
     def __post_init__(self) -> None:
         if self.view is None:
             self.view = RosterView(self.roster, self.config, board=self.state)
-        # Both scale the board to the draft rather than to the player file, and both
-        # are the same for every candidate on the pick, so they are settled once here
-        # instead of forty times in the scorer.
+        # Scales the board to the draft rather than to the player file, and is the same
+        # for every candidate on the pick, so it is settled once here instead of forty
+        # times in the scorer.
         picks = max(1, int(self.config.total_picks))
         if not self.horizon:
             self.horizon = max(
                 MIN_BOARD_HORIZON, int(round(picks * BOARD_HORIZON_SLACK))
             )
-        if not self.value_span:
-            self.value_span = max(MIN_VALUE_SPAN_PICKS, picks * VALUE_SPAN_FRACTION)
 
     @property
     def pool(self) -> PlayerPool:
@@ -826,7 +883,7 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
 
     horizon = context.horizon
     components["adp_value"] = w.adp * _value_term(
-        player, context.overall_pick, context.value_span
+        player, context.overall_pick, context.settings, context.round_number
     )
     components["projection"] = w.projection * _projection_term(player, pool, horizon)
     components["tier"] = w.tier * _tier_term(player, pool)
@@ -887,6 +944,9 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
     components["injury_penalty"] = -w.injury_penalty * _injury_term(player)
     components["positional_limit_penalty"] = -w.positional_limit_penalty * _limit_penalty(
         player, context.roster
+    )
+    components["premature_kicker_penalty"] = -w.premature_kicker_penalty * (
+        _premature_penalty(player, context.round_number, context.config)
     )
     components["roster_imbalance_penalty"] = -w.roster_imbalance_penalty * (
         _imbalance_penalty(
@@ -1003,7 +1063,7 @@ def choose_player(
     if not ranked:
         return None
     temperature = context.settings.temperature_for(
-        float(context.profile.get("predictability"))
+        float(context.profile.get("predictability")), context.round_number
     )
     pick_probabilities(ranked, temperature)
     roll = context.rng.random()
