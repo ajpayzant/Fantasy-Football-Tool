@@ -237,6 +237,64 @@ class TestShrinkage:
         assert shrinkage.season_weight(0) == 0.0
         assert shrinkage.season_weight(2) == pytest.approx(0.5)
 
+    def test_cluster_weight_rises_with_the_number_of_drafts(self) -> None:
+        shrinkage = ShrinkageConfig(draft_prior_strength=1.0)
+        assert shrinkage.cluster_weight(0) == 0.0
+        assert shrinkage.cluster_weight(1) == pytest.approx(0.5)
+        assert shrinkage.cluster_weight(2) == pytest.approx(2 / 3)
+        assert shrinkage.cluster_weight(3) == pytest.approx(0.75)
+
+    def test_one_draft_of_history_counts_for_less_than_three(
+        self, annotated: DraftHistory, synthetic_league: League
+    ) -> None:
+        """Sixteen picks from one August are not sixteen independent observations.
+
+        A brand-new league has exactly one draft on record, and treating its picks as
+        an independent sample each had the model describing settled personalities off
+        a single afternoon. The picks should still count — just for less.
+        """
+        settings = SimulationConfig()
+        manager = next(m for m in synthetic_league.managers if m.name == "Auto Pilot")
+        newest = max(d.season for d in annotated.drafts)
+        thin = DraftHistory(
+            drafts=[d for d in annotated.drafts if d.season == newest]
+        )
+        thin_profile = build_profile(manager, thin, settings=settings)
+        full_profile = build_profile(manager, annotated, settings=settings)
+
+        raw = estimate_parameters(
+            observe_manager(
+                manager.name, thin,
+                shrinkage=settings.shrinkage, estimation=settings.estimation,
+            ),
+            settings.estimation, shrinkage=settings.shrinkage,
+        )["rank_dependence"][1]
+        # One draft, so the effective sample is half the picks observed…
+        assert thin_profile.values["rank_dependence"].sample_size == pytest.approx(
+            raw * 0.5
+        )
+        # …and three drafts of the same manager are believed more than one.
+        assert (
+            full_profile.values["rank_dependence"].manager_weight
+            > thin_profile.values["rank_dependence"].manager_weight
+        )
+
+    def test_a_per_season_metric_is_not_discounted_twice(
+        self, annotated: DraftHistory, synthetic_league: League
+    ) -> None:
+        """``first_qb_round`` already shrinks on seasons, so it skips the draft prior."""
+        settings = SimulationConfig()
+        manager = next(m for m in synthetic_league.managers if m.name == "Auto Pilot")
+        profile = build_profile(manager, annotated, settings=settings)
+        expected = estimate_parameters(
+            observe_manager(
+                manager.name, annotated,
+                shrinkage=settings.shrinkage, estimation=settings.estimation,
+            ),
+            settings.estimation, shrinkage=settings.shrinkage,
+        )["first_qb_round"][1]
+        assert profile.values["first_qb_round"].sample_size == pytest.approx(expected)
+
 
 class TestProvenance:
     def test_observed_parameters_are_marked_observed(

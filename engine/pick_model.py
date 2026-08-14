@@ -26,6 +26,7 @@ import logging
 import math
 import random
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Iterable, Mapping, Sequence
 
 from core.config import LeagueConfig, ModelWeights, SimulationConfig
@@ -53,10 +54,45 @@ any one pick.
 """
 
 VALUE_SPAN_FRACTION: float = 0.25
-"""Fraction of the pool size over which ADP value is normalised to +/-1."""
+"""Fraction of *the draft* over which ADP value is normalised to +/-1.
+
+Of the draft — team count times rounds — and deliberately not of the player file.
+Normalising on the file made every value term a function of how many players the
+importer happened to load: a 1,000-player board gave a 250-pick span, so passing on the
+consensus number-one to take someone 45 picks early cost 0.18 utility while a positional
+tendency was worth 0.60. The model would take a fifth-round running back at pick five and
+the arithmetic said that was fine. The draft's length is the honest denominator, because
+that is the range a pick can actually be wrong by.
+"""
 
 MIN_VALUE_SPAN_PICKS: float = 24.0
-"""Floor for that span, so a tiny player file does not make every pick extreme."""
+"""Floor for that span, so a two-round test draft does not make every pick extreme."""
+
+BOARD_HORIZON_SLACK: float = 1.25
+"""Board depth graded by the value terms, as a multiple of the picks in the draft.
+
+Projection, value-over-replacement and platform rank are all *standings* — "where does
+this player sit" — and a standing needs a denominator. Using the file's length made the
+answer meaningless at the top of the board: in a 1,003-player file the best player scored
+1.000 and the fortieth scored 0.961, so a term weighted 0.55 separated the two by 0.02.
+Grading over the players who will actually be drafted, plus a quarter more for the ones
+just past the end, restores the difference the weight was written to express.
+"""
+
+MIN_BOARD_HORIZON: int = 48
+"""Floor for that depth, so a short draft still grades a reasonable board."""
+
+MAX_REACH_PENALTY: float = 3.0
+"""How far below -1 the ADP term may go for an absurd reach.
+
+Clipped symmetrically at -1, the term stopped distinguishing a bad pick from a
+ridiculous one: with a 40-pick span, reaching 45 picks and reaching 80 scored exactly
+the same, so nothing outweighed the small positive from roster need and a kicker could
+come off the board at pick seven. Value on the table genuinely does saturate — a player
+who lasted 200 picks past his ADP is not five times the bargain of one who lasted 40,
+because you can only use him once — but reaching gets steadily more indefensible with
+every pick, and the utility should say so.
+"""
 
 ADP_PLAUSIBILITY_SHARE: float = 0.25
 """Plausibility's weight as a share of the main ADP weight.
@@ -98,7 +134,7 @@ rounding error. The floor keeps such a pick close to a coin flip, which is the
 honest answer.
 """
 
-SPREAD_TEMPERATURE_DIVISOR: float = 4.0
+SPREAD_TEMPERATURE_DIVISOR: float = 2.0
 """Divides the utility spread before it scales temperature.
 
 Calibrated so the resulting probabilities match how real draft rooms behave over
@@ -107,6 +143,11 @@ player about half the time and stays inside their top three almost always, while
 an erratic one takes the top player only about one time in six. Without the
 divisor the distribution is far too flat — every candidate lands within a few
 percent of every other, and even a clearly correct pick wins only rarely.
+
+Halved from 4.0 when the spread it divides became a robust one — see
+:func:`pick_probabilities` — which is about half the size of the full best-to-worst
+range it replaced. The two changes together leave a normal pick's sharpness where it
+was and stop one outlier from setting everybody's temperature.
 """
 
 
@@ -220,7 +261,7 @@ def expected_survival(
 # ─────────────────────────────────────────────────────────────────────────────
 # Utility terms
 # ─────────────────────────────────────────────────────────────────────────────
-def _value_term(player: Player, pool: PlayerPool, overall_pick: int) -> float:
+def _value_term(player: Player, overall_pick: int, span: float) -> float:
     """Positive when a player has fallen past his ADP, negative when reaching.
 
     ``pick - adp``: a player who *fell* is still on the board later than the crowd
@@ -235,27 +276,30 @@ def _value_term(player: Player, pool: PlayerPool, overall_pick: int) -> float:
     this manager reach?", while this term asks "how much value is on the table?".
     Conflating the two is what produced the original inversion.
 
-    Scaled by the pool size so it stays in roughly [-1, 1] regardless of how
-    many players the file contained.
+    Scaled by ``span`` — a quarter of the draft, from
+    :data:`VALUE_SPAN_FRACTION` — so it means the same thing whether the player file
+    held 300 names or 3,000. Bargains cap at +1; reaches run to
+    :data:`MAX_REACH_PENALTY`, for the reason given there.
     """
     adp = player.adp_for()
     if adp is None:
         return 0.0
-    span = max(MIN_VALUE_SPAN_PICKS, float(len(pool)) * VALUE_SPAN_FRACTION)
-    return float(max(-1.0, min(1.0, (float(overall_pick) - float(adp)) / span)))
+    span = max(1.0, float(span))
+    value = (float(overall_pick) - float(adp)) / span
+    return float(max(-MAX_REACH_PENALTY, min(1.0, value)))
 
 
-def _projection_term(player: Player, pool: PlayerPool) -> float:
-    """The player's projection as a 0-1 percentile of the remaining pool."""
+def _projection_term(player: Player, pool: PlayerPool, horizon: int) -> float:
+    """The player's projection as a 0-1 percentile of the draftable board."""
     projection = player.projection
     if projection is None:
         return 0.0
-    return pool.projection_percentile(player)
+    return pool.projection_percentile(player, horizon=horizon)
 
 
-def _vor_term(player: Player, pool: PlayerPool) -> float:
-    """Value over replacement, normalised to 0-1 across the pool."""
-    return pool.vor_percentile(player)
+def _vor_term(player: Player, pool: PlayerPool, horizon: int) -> float:
+    """Value over replacement, normalised to 0-1 across the draftable board."""
+    return pool.vor_percentile(player, horizon=horizon)
 
 
 def _tier_term(player: Player, pool: PlayerPool) -> float:
@@ -481,16 +525,20 @@ def _round_preference_term(
     return bias * _preference_satiation(player, view)
 
 
-def _rank_term(player: Player, pool: PlayerPool, settings: SimulationConfig) -> float:
+def _rank_term(player: Player, horizon: int) -> float:
     """Agreement with the platform's own ranking, as a 0-1 score.
 
     Weighted at pick time by the manager's ``rank_dependence``, so an autodrafter
     follows the list closely and an independent thinker mostly ignores it.
+
+    Graded over ``horizon`` picks rather than the whole file, for the reason given at
+    :data:`BOARD_HORIZON_SLACK`: divided by 1,003 the difference between the first and
+    fortieth ranked player is 0.039, which no weight can turn back into a preference.
     """
     rank = player.rank_for()
     if rank is None:
         return 0.0
-    n = max(1, len(pool))
+    n = max(1, int(horizon))
     return float(max(0.0, 1.0 - (float(rank) - 1.0) / float(n)))
 
 
@@ -692,9 +740,26 @@ class PickContext:
     """Memoized roster/board facts. Built by :func:`context_for`; never ``None``
     in practice, but defaulted so a hand-built context still constructs."""
 
+    horizon: int = 0
+    """Board depth the value terms grade against — see :data:`BOARD_HORIZON_SLACK`.
+    Derived in ``__post_init__`` when left at 0, which is every real caller."""
+
+    value_span: float = 0.0
+    """Picks over which ADP value spans +/-1 — see :data:`VALUE_SPAN_FRACTION`."""
+
     def __post_init__(self) -> None:
         if self.view is None:
             self.view = RosterView(self.roster, self.config, board=self.state)
+        # Both scale the board to the draft rather than to the player file, and both
+        # are the same for every candidate on the pick, so they are settled once here
+        # instead of forty times in the scorer.
+        picks = max(1, int(self.config.total_picks))
+        if not self.horizon:
+            self.horizon = max(
+                MIN_BOARD_HORIZON, int(round(picks * BOARD_HORIZON_SLACK))
+            )
+        if not self.value_span:
+            self.value_span = max(MIN_VALUE_SPAN_PICKS, picks * VALUE_SPAN_FRACTION)
 
     @property
     def pool(self) -> PlayerPool:
@@ -759,11 +824,14 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
     view = context.view
     components: dict[str, float] = {}
 
-    components["adp_value"] = w.adp * _value_term(player, pool, context.overall_pick)
-    components["projection"] = w.projection * _projection_term(player, pool)
+    horizon = context.horizon
+    components["adp_value"] = w.adp * _value_term(
+        player, context.overall_pick, context.value_span
+    )
+    components["projection"] = w.projection * _projection_term(player, pool, horizon)
     components["tier"] = w.tier * _tier_term(player, pool)
     components["value_over_replacement"] = w.value_over_replacement * _vor_term(
-        player, pool
+        player, pool, horizon
     )
     components["roster_need"] = (
         w.roster_need
@@ -786,7 +854,7 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
     components["platform_rank"] = (
         w.platform_rank_dependence
         * float(profile.get("rank_dependence"))
-        * _rank_term(player, pool, context.settings)
+        * _rank_term(player, horizon)
     )
     components["rookie"] = w.rookie_preference * _rookie_term(player, profile)
     components["favorite_team"] = w.favorite_team_preference * _favorite_team_term(
@@ -889,13 +957,20 @@ def pick_probabilities(
     early would make the same manager look like a coin-flipper late. Scaling by
     the observed spread keeps "predictable" meaning the same thing all draft.
 
+    The spread is measured from the best candidate to the *median* one, not to the
+    worst. Best-to-worst let a single hopeless candidate set the temperature for
+    everybody: one player carrying a large reach penalty widened the spread, the wider
+    spread raised the temperature, and the higher temperature flattened the whole
+    distribution — so the presence of an obviously bad option made every good option
+    less likely. Half the board is a stable ruler; the tail of it is not.
+
     The max-utility offset keeps ``exp`` from overflowing on large utilities.
     """
     if not scored:
         return []
     utilities = [c.utility for c in scored]
     best = max(utilities)
-    spread = best - min(utilities)
+    spread = best - median(utilities)
     scale = max(UTILITY_SPREAD_FLOOR, spread) / SPREAD_TEMPERATURE_DIVISOR
     t = max(1e-3, float(temperature)) * scale
     weights = [math.exp((c.utility - best) / t) for c in scored]

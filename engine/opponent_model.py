@@ -38,6 +38,7 @@ from models.draft import DraftHistory, HistoricalPick
 from models.league import League
 from models.manager import (
     PARAM_KEYS,
+    SEASON_SCALED_PARAMS,
     UNIT_PARAMS,
     Manager,
     ManagerPreferences,
@@ -346,7 +347,8 @@ def estimate_parameters(
         out["favorite_team_rate"] = (top_share, observations.weighted_picks)
 
     # First-QB / first-TE round: a per-season observation, so it shrinks on
-    # seasons rather than picks.
+    # seasons rather than picks. Listed in :data:`SEASON_SCALED_PARAMS` so the
+    # per-draft discount is not applied to them twice.
     for key, position in (("first_qb_round", Position.QB), ("first_te_round", Position.TE)):
         stat = observations.first_round_by_position.get(position)
         mean = stat.mean if stat else None
@@ -613,15 +615,21 @@ def build_profile(
 
     estimates = estimate_parameters(observations, estimation, shrinkage=shrinkage)
     user_values = _user_entered_values(manager.preferences)
+    # Picks from one draft are correlated, so sixteen of them are not sixteen
+    # independent observations of a personality. See
+    # :meth:`core.config.ShrinkageConfig.cluster_weight`.
+    cluster = shrinkage.cluster_weight(observations.drafts)
 
     for key in PARAM_KEYS:
         estimate = estimates.get(key)
         fallback_value = fallbacks.blended(key, shrinkage)
         if estimate is None:
             _, provenance = fallbacks.value(key)
-            value, weight, observed = fallback_value, 0.0, None
+            value, weight, observed, sample = fallback_value, 0.0, None, 0.0
         else:
             observed, sample = estimate
+            if key not in SEASON_SCALED_PARAMS:
+                sample *= cluster
             weight = shrinkage.manager_weight(sample)
             value = weight * observed + (1.0 - weight) * fallback_value
             provenance = (
@@ -629,7 +637,9 @@ def build_profile(
                 if sample >= shrinkage.min_picks_for_observed
                 else ProvenanceKind.MODEL_INFERRED
             )
-        sample_size = estimate[1] if estimate else 0.0
+        # The *effective* sample, after the per-draft discount — reported rather than
+        # the raw count so the sample size shown next to a weight explains it.
+        sample_size = sample
 
         if key in user_values:
             value = _apply_user_value(value, user_values[key], estimation, key)
@@ -822,7 +832,8 @@ def _apply_positional_tendencies(
     archetype_bias = dict(archetype_params(profile.archetype).position_bias)
     archetype_early = dict(archetype_params(profile.archetype).early_round_position_bias)
 
-    weight = shrinkage.manager_weight(observations.weighted_picks)
+    cluster = shrinkage.cluster_weight(observations.drafts)
+    weight = shrinkage.manager_weight(observations.weighted_picks * cluster)
     bias: dict[Position, float] = {}
 
     for position in Position:
@@ -858,7 +869,7 @@ def _apply_positional_tendencies(
     # of a 16-round draft give only nine early picks to learn from.
     early_bias: dict[Position, float] = {}
     early_rounds = int(estimation.early_rounds)
-    early_weight = shrinkage.manager_weight(observations.early_picks)
+    early_weight = shrinkage.manager_weight(observations.early_picks * cluster)
     for position in Position:
         manager_early = _early_share(observations, position, estimation)
         league_early = _league_early_share(stats, position, early_rounds)

@@ -235,6 +235,90 @@ class TestValueTermSign:
         assert later > first
 
 
+class TestValueScalesToTheDraftNotTheFile:
+    """Regression: every value term was normalised on the *player file*.
+
+    A live import brought 1,003 players instead of the ~300 a spreadsheet holds, and
+    that alone changed how the model drafted: the ADP span went to 250 picks, so a
+    45-pick reach cost 0.18 utility against a 0.60-weighted positional tendency, and
+    projection percentiles at the top of the board compressed into 0.95–1.00 where no
+    weight could separate them. Round one filled with fifth-round players.
+    """
+
+    def test_the_adp_span_follows_the_draft_length(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        context = context_for(state, profiles[1])
+        assert context.value_span == pytest.approx(
+            max(24.0, 0.25 * context.config.total_picks)
+        )
+        # And is not a function of how many players the file happened to carry.
+        assert context.value_span < 0.25 * len(state.pool)
+
+    def test_a_bigger_file_does_not_change_the_score(
+        self, smoke_league: tuple[LeagueConfig, PlayerPool, League],
+        settings: SimulationConfig, profiles: dict[int, ManagerProfile],
+    ) -> None:
+        """The same board plus 400 undrafted names must score the same pick."""
+        _, pool, league = smoke_league
+        target = next(p for p in pool.players if (p.adp_for() or 0) >= 20.0)
+        base = score_candidate(
+            target,
+            context_for(
+                DraftState(league=league, pool=pool, settings=settings, seed=1),
+                profiles[1],
+            ),
+        )
+        padded = PlayerPool(
+            list(pool.players) + [
+                _player(f"filler-{i}", Position.WR, 400.0 + i)
+                for i in range(400)
+            ],
+            league=league.config,
+            metadata=PoolMetadata(),
+        )
+        widened = score_candidate(
+            target,
+            context_for(
+                DraftState(league=league, pool=padded, settings=settings, seed=1),
+                profiles[1],
+            ),
+        )
+        assert widened.components["adp_value"] == pytest.approx(
+            base.components["adp_value"]
+        )
+
+    def test_the_top_of_the_board_stays_distinguishable(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """The best player must out-score the tenth by more than a rounding error."""
+        context = context_for(state, profiles[1])
+        ranked = sorted(
+            (p for p in state.pool.players if p.projection is not None),
+            key=lambda p: -(p.projection or 0.0),
+        )
+        best = score_candidate(ranked[0], context).components["projection"]
+        tenth = score_candidate(ranked[9], context).components["projection"]
+        assert best - tenth > 0.02
+
+    def test_an_absurd_reach_costs_more_than_a_bad_one(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Regression: clipped at -1, a 45-pick reach and an 80-pick reach tied.
+
+        With the gradient dead past the clip, nothing outweighed the small positive
+        from roster need, and kickers came off the board in round one.
+        """
+        context = context_for(state, profiles[1])
+        span = context.value_span
+        bad = _player("bad", Position.RB, context.overall_pick + span * 1.5)
+        worse = _player("worse", Position.RB, context.overall_pick + span * 2.5)
+        bad_value = score_candidate(bad, context).components["adp_value"]
+        worse_value = score_candidate(worse, context).components["adp_value"]
+        assert bad_value < -1.0
+        assert worse_value < bad_value
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Candidate shortlist
 # ─────────────────────────────────────────────────────────────────────────────
@@ -391,6 +475,22 @@ class TestSoftmax:
 
     def test_an_empty_field_is_handled(self) -> None:
         assert pick_probabilities([], 0.5) == []
+
+    def test_one_hopeless_candidate_does_not_flatten_the_field(self) -> None:
+        """Regression: the spread was measured from the best to the *worst* candidate.
+
+        So adding an obviously terrible option widened the spread, the wider spread
+        raised the temperature, and the higher temperature made every *good* option
+        less likely — the shortlist's tail set everybody's decisiveness. Measuring to
+        the median instead leaves the top of the field alone.
+        """
+        field = [2.0, 1.9, 1.8, 1.7, 1.6]
+        clean = pick_probabilities(_fake_scored(field), 0.5)
+        with_outlier = pick_probabilities(_fake_scored([*field, -8.0]), 0.5)
+        assert with_outlier[0].probability == pytest.approx(
+            clean[0].probability, rel=0.1
+        )
+        assert with_outlier[-1].probability < 1e-6
 
 
 class TestPredictabilityOrdersDecisiveness:

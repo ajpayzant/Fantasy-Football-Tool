@@ -11,6 +11,7 @@ from engine.features import (
     summarize_history,
 )
 from models.draft import DraftHistory, HistoricalDraft, HistoricalPick, Pick
+from models.player import Player, PlayerPool, PoolMetadata
 
 
 def _pick(overall: int, manager: str, position: Position, team: str, **kw) -> HistoricalPick:
@@ -287,3 +288,66 @@ class TestAnnotateHistory:
         second = annotate_history(synthetic_history)
         assert [p.adp_delta for p in synthetic_history.all_picks] == snapshot
         assert first.pick_count == second.pick_count
+
+
+class TestSeasonSpecificFieldsStayInTheirSeason:
+    """Regression: last season's picks were priced off this season's board.
+
+    ADP describes one August. Filling a 2025 pick from the 2026 board reported
+    Ja'Marr Chase going at 4.7 in a draft where he went 46th, so every manager who
+    took a player whose stock had moved looked like they reached forty picks — which
+    collapsed their estimated predictability and made the simulator draft erratically
+    on their behalf.
+    """
+
+    def _board(self, season: int | None) -> PlayerPool:
+        return PlayerPool(
+            [
+                Player(
+                    player_id="p1", name="P1", position=Position.RB,
+                    overall_adp=4.7, platform_rank=5.0, projection=250.0, tier=1,
+                )
+            ],
+            metadata=PoolMetadata(season=season),
+        )
+
+    def _draft(self, season: int, **kw) -> HistoricalDraft:
+        pick = HistoricalPick(
+            season=season, manager_name="A", overall_pick=46,
+            player_name="P1", position=Position.RB, **kw,
+        )
+        return HistoricalDraft(season=season, picks=[pick])
+
+    def test_a_same_season_board_still_fills_the_gaps(self) -> None:
+        draft = self._draft(2026)
+        annotate_draft(draft, pool=self._board(2026))
+        assert draft.picks[0].adp == 4.7
+        assert draft.picks[0].tier == 1
+
+    def test_a_different_season_board_is_not_used(self) -> None:
+        draft = self._draft(2025)
+        annotate_draft(draft, pool=self._board(2026))
+        assert draft.picks[0].adp is None
+        assert draft.picks[0].adp_delta is None
+        # Position and NFL team are facts about the player, not the August.
+        assert draft.picks[0].position is Position.RB
+
+    def test_an_adp_already_copied_off_the_wrong_board_is_dropped(self) -> None:
+        """The bad values are in the database already; nothing else revisits them."""
+        draft = self._draft(2025, adp=4.7, platform_rank=5.0)
+        annotate_draft(draft, pool=self._board(2026))
+        assert draft.picks[0].adp is None
+        assert draft.picks[0].platform_rank is None
+
+    def test_a_genuine_adp_from_the_users_file_survives(self) -> None:
+        """A real 2025 ADP does not agree with a 2026 ADP to the decimal place."""
+        draft = self._draft(2025, adp=42.0)
+        annotate_draft(draft, pool=self._board(2026))
+        assert draft.picks[0].adp == 42.0
+        assert draft.picks[0].adp_delta == 42.0 - 46.0
+
+    def test_a_board_with_no_season_is_trusted(self) -> None:
+        """An uploaded spreadsheet often says nothing about which year it is."""
+        draft = self._draft(2025)
+        annotate_draft(draft, pool=self._board(None))
+        assert draft.picks[0].adp == 4.7

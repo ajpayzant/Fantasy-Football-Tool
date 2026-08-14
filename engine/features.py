@@ -318,17 +318,56 @@ def _consume_tier(
 def _backfill_from_pool(
     picks: Sequence[HistoricalPick], pool: PlayerPool | None
 ) -> None:
-    """Fill missing position / team / ADP / tier fields from a player pool.
+    """Reconcile historical picks against a player pool.
 
-    Only *missing* fields are touched — a value in the user's file always wins,
-    since the pool may describe a different season.
+    Two jobs. *Fill* what the recap left blank — position, NFL team, and, when the
+    pool describes the same season as the pick, that season's ADP, rank, projection
+    and tier. Only missing fields are filled: a value in the user's file always wins.
+
+    And *undo* an earlier version of this function's cross-season fill. ADP is a fact
+    about one August. Read off the 2026 board, a 2025 pick of Ja'Marr Chase says he
+    went at 4.7 when he actually went 46th, so every manager who took a player whose
+    stock moved looks like they reached forty picks. That inflated one league's reach
+    spread to 28 picks and dragged every manager's estimated predictability to 0.14,
+    and a manager the model thinks is unpredictable is a manager it drafts erratically
+    for — kickers in round one. A missing ADP teaches the model nothing, which is the
+    correct amount to learn from a number nobody recorded; a wrong one teaches it
+    something false.
+
+    Undoing matters because those values are already in the database, written before
+    this function knew to check the season, and nothing else will ever revisit them.
+    But a genuine ADP from the user's own file has to survive, so only a value that
+    *exactly equals* what this board would have written is dropped — a real 2025 ADP
+    agreeing with a 2026 ADP to the last decimal place does not happen. Applied to ADP,
+    rank and projection, which carry enough precision for that test to mean something,
+    and not to ``tier``, where a 2 is a 2 and the coincidence is routine.
+
+    ``is_rookie`` is left alone for the same reason in a stronger form: it is a bool,
+    so "clear" and "false" are the same value, and blanking it would tell the model
+    every manager reliably avoids rookies — a confident wrong answer, where a few
+    stale flags are only a vague one.
     """
     if pool is None:
         return
     index = {player_key(p.name): p for p in pool}
+    pool_season = pool.metadata.season
     matched = 0
+    cleared_seasons: set[int] = set()
     for pick in picks:
         player = index.get(player_key(pick.player_name))
+        # Unknown seasons on either side are treated as a match, which is the old
+        # behaviour and the only useful guess for a pasted recap with no year on it.
+        off_season = bool(
+            pool_season and pick.season and int(pick.season) != int(pool_season)
+        )
+        if off_season and player is not None:
+            if pick.adp is not None and pick.adp == player.adp_for():
+                pick.adp = None
+                cleared_seasons.add(int(pick.season))
+            if pick.platform_rank is not None and pick.platform_rank == player.rank_for():
+                pick.platform_rank = None
+            if pick.projection is not None and pick.projection == player.projection:
+                pick.projection = None
         if player is None:
             continue
         matched += 1
@@ -336,6 +375,8 @@ def _backfill_from_pool(
             pick.position = player.position
         if not pick.nfl_team:
             pick.nfl_team = player.nfl_team
+        if off_season:
+            continue
         if pick.adp is None:
             pick.adp = player.adp_for()
         if pick.platform_rank is None:
@@ -350,6 +391,12 @@ def _backfill_from_pool(
         LOGGER.debug(
             "Backfilled %d/%d historical picks from the player pool",
             matched, len(picks),
+        )
+    if cleared_seasons:
+        LOGGER.info(
+            "Dropped board-copied ADP/rank/projection from %s picks: the board is "
+            "season %s, so those numbers describe a different draft",
+            ", ".join(str(s) for s in sorted(cleared_seasons)), pool_season,
         )
 
 

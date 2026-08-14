@@ -555,6 +555,15 @@ PARAM_LABELS: dict[str, str] = {
     "first_te_round": "Round of first TE",
 }
 
+# Parameters observed once per draft rather than once per pick, and therefore
+# already shrunk on the number of seasons before they reach the pick-based
+# shrinkage. The per-draft discount in
+# :meth:`core.config.ShrinkageConfig.cluster_weight` skips these so it is not
+# charged twice.
+SEASON_SCALED_PARAMS: frozenset[str] = frozenset({
+    "first_qb_round", "first_te_round",
+})
+
 # Parameters bounded to [0, 1]; others are unbounded/round numbers.
 UNIT_PARAMS: frozenset[str] = frozenset({
     "rank_dependence", "need_dependence", "rookie_rate", "stack_rate",

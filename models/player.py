@@ -1062,26 +1062,33 @@ class PlayerPool:
             }
         return self._vor_rank_cache.get(player.player_id, float(len(self._players)))
 
-    def projection_percentile(self, player: Player) -> float:
+    def projection_percentile(
+        self, player: Player, *, horizon: int | None = None
+    ) -> float:
         """Projection standing as 0-1, where 1.0 is the highest-projected player.
 
         A percentile rather than a raw point total so the pick model's weights
         mean the same thing whether a file carries season points, per-game
         points, or an arbitrary index.
+
+        ``horizon`` grades over the top *n* players instead of the whole file;
+        everyone past it scores 0. Pass the number of players who will actually be
+        drafted, and the difference between the first and fortieth stops rounding
+        away. See :data:`engine.pick_model.BOARD_HORIZON_SLACK`.
         """
         if player.projection is None:
             return 0.0
-        return self._rank_to_percentile(self._projection_rank(player))
+        return self._rank_to_percentile(self._projection_rank(player), horizon)
 
-    def vor_percentile(self, player: Player) -> float:
+    def vor_percentile(self, player: Player, *, horizon: int | None = None) -> float:
         """Value-over-replacement standing as 0-1, 1.0 being the most valuable."""
         if player.value_over_replacement is None:
             return 0.0
-        return self._rank_to_percentile(self._vor_rank(player))
+        return self._rank_to_percentile(self._vor_rank(player), horizon)
 
-    def _rank_to_percentile(self, rank: float) -> float:
+    def _rank_to_percentile(self, rank: float, horizon: int | None = None) -> float:
         """Convert a 1-based rank into a 0-1 score where rank 1 scores 1.0."""
-        n = max(1, len(self._players))
+        n = max(1, int(horizon) if horizon else len(self._players))
         if n == 1:
             return 1.0
         return float(max(0.0, min(1.0, (float(n) - float(rank)) / float(n - 1))))

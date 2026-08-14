@@ -345,6 +345,23 @@ if len(thin):
         "work, not evidence."
     )
 
+single = overview[overview["Seasons"] == 1]
+if len(single) and len(single) == len(overview):
+    st.caption(
+        "Every manager here has one draft on record. Sixteen picks from a single "
+        "August are one afternoon's mood as much as a personality, so they are "
+        "counted at **half** strength — a second season raises that to two thirds, "
+        "a third to three quarters. The table still shows what those picks say; the "
+        "simulator just leans on the league average more than the numbers suggest."
+    )
+elif len(single):
+    st.caption(
+        ", ".join(single["Manager"])
+        + " have one draft on record, so their picks count at half strength — "
+        "correlated picks from a single August are weaker evidence than the same "
+        "count spread over three seasons."
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Confidence in these profiles
 # ─────────────────────────────────────────────────────────────────────────────

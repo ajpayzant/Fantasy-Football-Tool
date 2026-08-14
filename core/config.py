@@ -428,6 +428,17 @@ class ShrinkageConfig:
     season_prior_strength: float = 2.0
     """Pseudo-count in *seasons*, for metrics observed once per draft rather than
     once per pick (e.g. the round of a manager's first quarterback)."""
+    draft_prior_strength: float = 1.0
+    """Pseudo-count in *drafts*, discounting a per-pick sample drawn from few drafts.
+
+    ``prior_strength`` treats sixteen picks as sixteen independent observations, and
+    from a single draft they are nothing of the kind: one manager who spent a bad
+    August chasing quarterbacks produces sixteen correlated picks that read as a
+    settled personality. A new league with one year of history would have its
+    managers modelled at 40% personalisation off that one afternoon. This shrinks the
+    effective sample by ``drafts / (drafts + 1)`` — one draft counts half, two
+    two-thirds, three three-quarters — so a single season still moves the model, just
+    not as far as three seasons of the same tendency would."""
     league_share: float = 0.45
     platform_share: float = 0.30
     baseline_share: float = 0.25
@@ -454,6 +465,18 @@ class ShrinkageConfig:
         """Shrinkage weight for a per-season observation (e.g. first-QB round)."""
         n = max(0.0, float(seasons))
         return n / (n + max(1e-9, self.season_prior_strength))
+
+    def cluster_weight(self, drafts: float) -> float:
+        """How much of a per-pick sample to believe, given how many drafts it spans.
+
+        Applied to the sample *size* rather than to the estimate, so it compounds with
+        :meth:`manager_weight` instead of competing with it. See
+        :attr:`draft_prior_strength`.
+        """
+        n = max(0.0, float(drafts))
+        if n <= 0:
+            return 0.0
+        return n / (n + max(1e-9, self.draft_prior_strength))
 
     def recency_decay(self, seasons_ago: float) -> float:
         """Exponential weight for a pick made ``seasons_ago`` seasons back."""
