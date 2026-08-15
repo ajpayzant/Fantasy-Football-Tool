@@ -548,8 +548,13 @@ def test_stating_a_tendency_lands_on_the_league_and_the_profile(loaded) -> None:
     _assert_clean(app, "3_manager_profiles.py")
     slot = _first_slot(loaded)
 
-    app.checkbox(key=f"pref_on_{slot}_risk_tolerance").check().run()
-    app.slider(key=f"pref_val_{slot}_risk_tolerance").set_value(0.95).run()
+    # One widget per tendency, with "no opinion" as its own leftmost stop. It used
+    # to be a checkbox gating a disabled slider, which is unusable in a browser:
+    # nothing inside a form reruns until it is submitted, so ticking the box left
+    # the slider frozen. AppTest sets values directly and so never saw it.
+    tendency = app.select_slider(key=f"pref_val_{slot}_risk_tolerance")
+    assert "no opinion" in [str(option) for option in tendency.options]
+    tendency.set_value(0.95).run()
     _button = next(b for b in app.button if "Save what I know" in str(b.label))
     _button.click().run()
     _assert_clean(app, "3_manager_profiles.py (after save)")
@@ -577,6 +582,9 @@ def test_an_untouched_slider_states_nothing(loaded) -> None:
     app = _profiles_app(loaded)
     slot = _first_slot(loaded)
     before = app.session_state[ui_state.K_PROFILES][slot].get("risk_preference")
+    assert str(app.select_slider(key=f"pref_val_{slot}_risk_tolerance").value) == (
+        "no opinion"
+    )
 
     next(b for b in app.button if "Save what I know" in str(b.label)).click().run()
     _assert_clean(app, "3_manager_profiles.py (empty save)")
@@ -586,6 +594,30 @@ def test_an_untouched_slider_states_nothing(loaded) -> None:
     assert manager.preferences.rookie_preference is None
     after = app.session_state[ui_state.K_PROFILES][slot].get("risk_preference")
     assert after == pytest.approx(before)
+
+
+def test_stating_zero_is_an_opinion_not_a_blank(loaded) -> None:
+    """0% has to survive the round trip — it is the whole reason for the extra stop.
+
+    "Never takes a rookie" and "I have no idea whether they take rookies" are
+    different statements, and a single 0–1 slider cannot hold both.
+    """
+    from ui import state as ui_state
+
+    app = _profiles_app(loaded)
+    slot = _first_slot(loaded)
+
+    app.select_slider(key=f"pref_val_{slot}_rookie_preference").set_value(0.0).run()
+    next(b for b in app.button if "Save what I know" in str(b.label)).click().run()
+    _assert_clean(app, "3_manager_profiles.py (zero)")
+
+    preferences = app.session_state[ui_state.K_LEAGUE].manager_by_slot(slot).preferences
+    assert preferences.rookie_preference == pytest.approx(0.0)
+    assert preferences.has_any
+    # And the widget comes back holding it, not reset to no opinion.
+    assert app.select_slider(key=f"pref_val_{slot}_rookie_preference").value == (
+        pytest.approx(0.0)
+    )
 
 
 def test_a_stated_strategy_overrides_the_inferred_archetype(loaded) -> None:
@@ -622,8 +654,7 @@ def test_stated_preferences_survive_pressing_build_profiles_again(loaded) -> Non
 
     app = _profiles_app(loaded)
     slot = _first_slot(loaded)
-    app.checkbox(key=f"pref_on_{slot}_rookie_preference").check().run()
-    app.slider(key=f"pref_val_{slot}_rookie_preference").set_value(0.9).run()
+    app.select_slider(key=f"pref_val_{slot}_rookie_preference").set_value(0.9).run()
     next(b for b in app.button if "Save what I know" in str(b.label)).click().run()
     _assert_clean(app, "3_manager_profiles.py (before rebuild)")
 
@@ -657,8 +688,7 @@ def test_forgetting_what_you_told_it_restores_the_model(loaded) -> None:
 
     app = _profiles_app(loaded)
     slot = _first_slot(loaded)
-    app.checkbox(key=f"pref_on_{slot}_predictability").check().run()
-    app.slider(key=f"pref_val_{slot}_predictability").set_value(0.05).run()
+    app.select_slider(key=f"pref_val_{slot}_predictability").set_value(0.05).run()
     next(b for b in app.button if "Save what I know" in str(b.label)).click().run()
     assert app.session_state[ui_state.K_LEAGUE].manager_by_slot(
         slot

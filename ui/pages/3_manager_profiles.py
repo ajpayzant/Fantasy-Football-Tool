@@ -32,6 +32,14 @@ from ui import components, state
 LOGGER = logging.getLogger("fantasy_mock_draft.ui.profiles")
 
 
+_NO_OPINION = "no opinion"
+
+
+def _tendency_stop_label(stop: object) -> str:
+    """Label a tendency stop: the no-opinion end reads as words, the rest as a %."""
+    return _NO_OPINION if stop == _NO_OPINION else f"{float(stop):.0%}"
+
+
 def _unmatched_names(names: list[str], player_pool) -> list[str]:
     """Names the user typed that match nobody on the board.
 
@@ -573,8 +581,9 @@ else:
 
             st.markdown("**Tendencies**")
             st.caption(
-                "Each slider starts at *no opinion*. Move one and it becomes evidence "
-                "about that manager; leave it and the estimate stands."
+                "Each slider starts at *no opinion*, the leftmost stop. Drag one off "
+                "it and it becomes evidence about that manager; leave it there and the "
+                "estimate stands."
             )
             slider_specs = [
                 ("risk_tolerance", "Risk appetite",
@@ -593,21 +602,32 @@ else:
             for index, (attribute, label, help_text) in enumerate(slider_specs):
                 column = slider_columns[index % 3]
                 saved_value = getattr(stated, attribute)
-                # A checkbox rather than a magic slider position, because 0.0 is a
-                # meaningful answer ("never takes a rookie") and must be distinct from
-                # "I have no opinion". ``None`` is what the engine reads as no opinion.
-                has_opinion = column.checkbox(
-                    label, value=saved_value is not None,
-                    key=f"pref_on_{chosen_slot}_{attribute}",
+                # One widget, with *no opinion* as its own stop, because 0.0 is a
+                # meaningful answer ("never takes a rookie") and must stay distinct
+                # from "I have nothing to say" — which is the ``None`` the engine
+                # reads as leave-the-estimate-alone. This was previously a checkbox
+                # gating a disabled slider, which cannot work inside a form: nothing
+                # inside a form reruns until it is submitted, so ticking the box left
+                # the slider frozen until after a save.
+                stops: list[object] = [_NO_OPINION] + [
+                    round(step * 0.05, 2) for step in range(21)
+                ]
+                if saved_value is not None and float(saved_value) not in stops:
+                    # A value from elsewhere (an import, a finer-grained edit) keeps
+                    # its own stop rather than being rounded off behind the user.
+                    stops = [_NO_OPINION] + sorted(
+                        [float(saved_value)] + [s for s in stops[1:]]
+                    )
+                value = column.select_slider(
+                    label, options=stops,
+                    value=_NO_OPINION if saved_value is None else float(saved_value),
+                    format_func=_tendency_stop_label,
+                    key=f"pref_val_{chosen_slot}_{attribute}",
                     help=help_text or None,
                 )
-                value = column.slider(
-                    f"{label} value", min_value=0.0, max_value=1.0,
-                    value=float(saved_value) if saved_value is not None else 0.5,
-                    step=0.05, key=f"pref_val_{chosen_slot}_{attribute}",
-                    label_visibility="collapsed", disabled=not has_opinion,
+                slider_values[attribute] = (
+                    None if value == _NO_OPINION else float(value)
                 )
-                slider_values[attribute] = float(value) if has_opinion else None
 
             st.markdown("**Positions**")
             position_columns = st.columns(2)
