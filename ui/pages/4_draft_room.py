@@ -8,9 +8,11 @@ first and the advice last:
 * **Best players left** — the shortlist, so a pick can be made without consulting the
   model at all.
 * **Who picks between now and my next turn**, and what they are likely to take.
-* **Who will still be there when I pick again** — survival odds, simulated against
-  those specific managers rather than against ADP.
 * **What to take now**, through several lenses, each with its own justification.
+* **The plan** — who should still be there at each of the next two turns, sorted into
+  take-now / save-for-next / can-wait, plus a pick-by-pick forecast of what the room
+  does in between. Simulated against those specific managers rather than against ADP,
+  and from the same rollouts the recommendations used, so the two cannot disagree.
 
 Every recommendation is advisory. You can draft anyone at any time, undo, or hand
 the pick to the engine.
@@ -28,8 +30,13 @@ from core.validation import ConfigurationError
 from engine.draft_state import DraftState
 from engine.recommender import recommend_for
 from engine.simulator import (
+    PLAN_GONE_BY,
+    PLAN_LASTS,
+    PLAN_TURNS,
+    DraftPlan,
     DraftSimulator,
     likely_next_picks,
+    simulate_draft_plan,
     upcoming_position_pressure,
 )
 from models.database import session_scope
@@ -39,6 +46,42 @@ from services.repository import save_mock_draft
 from ui import board_views, components, state
 
 LOGGER = logging.getLogger("fantasy_mock_draft.ui.draft_room")
+
+def _run_plan(
+    draft: DraftState,
+    profiles: dict,
+    *,
+    draft_slot: int,
+    turns: int,
+    simulations: int,
+    targets: list,
+) -> DraftPlan:
+    """Run the look-ahead rollouts behind a progress bar.
+
+    Wrapped in a function so the bar exists only on a cache miss. A bar drawn on
+    every rerun and instantly filled reads as "it is simulating again", which is the
+    impression the cache exists to avoid.
+
+    Targets are passed through as ``extra_players``: survival is tracked for the top
+    of the board, and a user's own sleeper can sit outside that window — which is
+    precisely the player they most want an answer about.
+    """
+    bar = st.progress(0.0, text=f"Simulating {simulations} rollouts of the room…")
+    try:
+        return simulate_draft_plan(
+            draft, profiles,
+            draft_slot=int(draft_slot),
+            turns=int(turns),
+            simulations=int(simulations),
+            extra_players=targets,
+            seed=draft.seed,
+            progress=lambda done, total: bar.progress(
+                done / max(1, total), text=f"Rollout {done} of {total}"
+            ),
+        )
+    finally:
+        bar.empty()
+
 
 _K_RESUME_IDS = "resume_draft_ids"
 """Session key holding ``(league_id, source_id)`` for the autosave.
@@ -344,7 +387,9 @@ with runs_tab:
                 f"Positions taken in the last {window} picks",
             )
     gaps = {
-        str(position): ("never" if gap is None else gap)
+        # Uniformly strings: a mixed int/"never" column makes Streamlit fall back
+        # to its slow Arrow repair path and log a traceback on every rerun.
+        str(position): ("never" if gap is None else str(gap))
         for position, gap in snapshot.picks_since_position.items()
     }
     st.markdown("**Picks since each position last went**")
@@ -459,7 +504,9 @@ if not draft.is_complete:
             st.caption(
                 "The single most likely pick for each manager, with its probability. "
                 "These are guesses about individuals, not the field — a 12% likeliest "
-                "pick means that manager's choice is genuinely open."
+                "pick means that manager's choice is genuinely open. Each manager is "
+                "read here in isolation; the plan further down simulates them in "
+                "sequence, so it also catches the runs one pick starts in the next."
             )
             st.dataframe(
                 pd.DataFrame([
@@ -496,18 +543,27 @@ st.divider()
 if not draft.is_complete:
     st.subheader("What to do with this pick")
 
-    rec_columns = st.columns([1, 1, 2])
+    rec_columns = st.columns([1, 1, 1, 2])
     simulations = rec_columns[0].number_input(
         "Availability simulations", min_value=20, max_value=1000,
         value=int(settings.availability_simulations), step=20,
         help="More runs, tighter survival estimates, slower page. 120 is usually "
              "enough to separate 'safe' from 'coin flip'.",
     )
-    shortlist_size = rec_columns[1].number_input(
+    look_ahead = rec_columns[1].selectbox(
+        "Look ahead", [PLAN_TURNS, 1],
+        format_func=lambda turns: (
+            "Your next two picks" if turns > 1 else "Your next pick only"
+        ),
+        help="Two turns is what lets the plan say 'take the receiver now, the tight "
+             "end lasts'. It costs roughly half again as much time, because the "
+             "rollouts have to run twice as deep into the board.",
+    )
+    shortlist_size = rec_columns[2].number_input(
         "Shortlist size", min_value=4, max_value=40, value=12,
         help="How many candidates each lens scores over.",
     )
-    auto = rec_columns[2].checkbox(
+    auto = rec_columns[3].checkbox(
         "Recompute automatically at every pick", value=True,
         help="Off, recommendations are computed only when you press the button — "
              "useful while advancing quickly through opponent picks.",
@@ -515,24 +571,49 @@ if not draft.is_complete:
 
     run_now = st.button("Compute recommendations", type="primary")
 
+    plan = None
     recommendation_set = None
     if auto or run_now:
         # Stamped on the pick index so a recommendation computed two picks ago is
         # never shown as if it applied to the current board.
         # The board is part of the stamp because it is part of the answer: editing a
         # target list must recompute, and the cache cannot see inside the object.
+        _board = state.user_board()
         stamp = (
-            draft.pick_index, int(simulations), int(shortlist_size),
-            state.user_board().fingerprint,
+            draft.pick_index, int(simulations), int(shortlist_size), int(look_ahead),
+            _board.fingerprint,
         )
-        with st.spinner(f"Simulating {simulations} rollouts to your next pick…"):
+        # One set of rollouts feeds both panels: the plan runs them, and the
+        # recommendations are handed the first turn's report rather than simulating
+        # the same picks again. That halves the wait and, more importantly, means the
+        # survival figure on a card is the same number the table below shows.
+        # A lens can in principle name a player outside the tracked window — deep on
+        # the board but high utility for a specific roster hole — and he reads as
+        # certain to survive. That is the documented meaning of an untracked player
+        # rather than a missing answer: nobody in the room is close to taking him.
+        plan = state.cached(
+            "draft_plan",
+            lambda: _run_plan(
+                draft, profiles,
+                draft_slot=user_slot,
+                turns=int(look_ahead),
+                simulations=int(simulations),
+                targets=[
+                    player for player in draft.available_players()
+                    if _board.is_target(player)
+                ],
+            ),
+            stamp=stamp,
+        )
+        with st.spinner("Scoring the lenses…"):
             recommendation_set = state.cached(
                 "recommendations",
                 lambda: recommend_for(
                     draft, profiles,
-                    board=state.user_board(),
+                    board=_board,
                     simulations=int(simulations),
                     shortlist_size=int(shortlist_size),
+                    availability=plan.first_report if plan is not None else None,
                     seed=draft.seed,
                 ),
                 stamp=stamp,
@@ -623,65 +704,141 @@ if not draft.is_complete:
                 "to your pick using the controls above."
             )
 
-        # -- survival table ---------------------------------------------------
-        availability = recommendation_set.availability
-        if availability is not None:
+    # ─────────────────────────────────────────────────────────────────────────
+    # The plan: what should be there at each of your next two picks
+    #
+    # Same rollouts as the recommendations above, so a survival figure on a card
+    # and a survival figure in this table are the same number, not two estimates
+    # of it. The stand-in pick the model makes for you at the first turn is not
+    # counted as competition — see ``DraftPlan`` — so the second turn reads as
+    # "the room leaves him alone that long", which is the part you do not control.
+    # ─────────────────────────────────────────────────────────────────────────
+    if plan is not None and not plan.is_empty:
+        st.markdown(
+            "#### Your next two picks"
+            if len(plan.turns) > 1 else "#### Your next pick"
+        )
+        st.caption(
+            f"{plan.simulations or 'No'} simulated drafts from here to "
+            + " and ".join(f"**{turn.label}**" for turn in plan.turns)
+            + ". Each rollout runs your league's modelled managers over every pick "
+            "in between — their board order, their ADP, and what they have already "
+            "drafted — so the answer accounts for the positional runs that ADP "
+            "alone cannot see. It is a forecast of a room, not a ranking."
+        )
+
+        windows = plan.windows()
+        if windows.is_empty:
+            st.caption("Nothing on the board is close enough to a decision to sort.")
+        else:
+            window_columns = st.columns(3)
+            _second = plan.turn(2)
+            for column, (title, hint, entries) in zip(window_columns, [
+                (
+                    "⚡ Take now",
+                    f"Under {PLAN_GONE_BY:.0%} to reach {plan.turns[0].label}",
+                    windows.take_now,
+                ),
+                (
+                    "🎯 Save for your next pick",
+                    (
+                        f"Should reach {plan.turns[0].label} but not "
+                        f"{_second.label}" if _second is not None else
+                        "Needs a second turn to plan for"
+                    ),
+                    windows.next_turn,
+                ),
+                (
+                    "⏳ Can wait",
+                    (
+                        f"Over {PLAN_LASTS:.0%} to reach "
+                        f"{(_second or plan.turns[0]).label}"
+                    ),
+                    windows.can_wait,
+                ),
+            ]):
+                with column.container(border=True):
+                    st.markdown(f"**{title}**")
+                    st.caption(hint)
+                    if not entries:
+                        st.caption("— nobody")
+                        continue
+                    for entry in entries:
+                        st.markdown(
+                            f"- **{entry.player.name}** {entry.player.position}  \n"
+                            f"  `{components.survival_bar(entry.survival)}`"
+                        )
+
+        # -- survival, one column per turn ------------------------------------
+        plan_frame = plan.to_frame()
+        if not plan_frame.empty:
             with st.expander(
-                f"Will they last? — {len(availability.players)} players, "
-                f"{availability.simulations} simulations"
+                f"Will they last? — {len(plan_frame)} players, "
+                f"{plan.simulations} simulations"
             ):
                 st.caption(
-                    "Probability each player is still on the board at your next pick "
-                    f"(overall {availability.target_pick}), and who tends to take them "
-                    "when they go. This is simulated against your league's modelled "
-                    "managers, so it differs from what raw ADP would suggest."
+                    "Probability each player is still on the board when each of your "
+                    "picks arrives, best players first, and who tends to take them "
+                    "when they go. Click a column header to sort by it."
                 )
-                rows = []
-                for entry in sorted(
-                    availability.players.values(), key=lambda e: -e.survival
-                ):
-                    taken_by = ", ".join(
-                        f"{name} {count / max(1, entry.simulations):.0%}"
-                        for name, count in sorted(
-                            entry.taken_by.items(), key=lambda kv: -kv[1]
-                        )[:3]
-                    )
-                    rows.append({
-                        "Player": entry.player.name,
-                        "Pos": str(entry.player.position),
-                        "ADP": entry.player.overall_adp,
-                        "Survives": entry.survival,
-                        "": components.survival_bar(entry.survival),
-                        "Usually gone by": (
-                            round(entry.mean_pick_taken, 1)
-                            if entry.mean_pick_taken is not None else None
-                        ),
-                        "Most likely taken by": taken_by or "—",
-                    })
-                survival_frame = pd.DataFrame(rows)
                 st.dataframe(
-                    survival_frame, width="stretch", hide_index=True,
-                    height=420,
+                    plan_frame, width="stretch", hide_index=True, height=420,
                     column_config={
-                        "Survives": st.column_config.ProgressColumn(
-                            "Survives", min_value=0.0, max_value=1.0, format="%.0f%%",
-                        ),
+                        f"Pick {turn.overall_pick}": st.column_config.ProgressColumn(
+                            f"At {turn.label}",
+                            help=(
+                                f"Survives the {turn.picks_until} pick(s) by other "
+                                f"managers before your {turn.round_label} selection."
+                            ),
+                            min_value=0.0, max_value=1.0, format="%.0f%%",
+                        )
+                        for turn in plan.turns
                     },
                 )
                 components.download_frame(
-                    survival_frame, "Download survival table (CSV)",
-                    f"survival_pick_{draft.pick_index + 1}.csv",
+                    plan_frame, "Download the plan (CSV)",
+                    f"plan_pick_{draft.pick_index + 1}.csv",
                 )
-                if availability.position_gone:
-                    st.caption(
-                        "Probability the *entire* startable supply at a position is "
-                        "gone before your turn: "
-                        + " · ".join(
-                            f"{position} {probability:.0%}"
-                            for position, probability in availability.position_gone.items()
-                            if probability > 0.01
+                for turn in plan.turns:
+                    gone = {
+                        position: probability
+                        for position, probability
+                        in turn.availability.position_gone.items()
+                        if probability > 0.01
+                    }
+                    if gone:
+                        st.caption(
+                            f"Share of the tracked pool taken by {turn.label}: "
+                            + " · ".join(
+                                f"{position} {probability:.0%}"
+                                for position, probability in gone.items()
+                            )
                         )
-                    )
+
+        # -- what the room does in between -------------------------------------
+        if plan.room:
+            with st.expander(
+                f"Who picks before you, and what they take — {len(plan.room)} picks"
+            ):
+                st.caption(
+                    "One row per pick between now and your last planned turn. The "
+                    "position is the part the simulation is confident about; the named "
+                    "player is the single most frequent choice, and a low percentage "
+                    "there means that manager's pick is genuinely open rather than that "
+                    "the model is unsure. *Roster so far* and *How they draft* are the "
+                    "inputs behind the guess — what they already own, and their "
+                    "modelled tendencies from their own draft history."
+                )
+                st.dataframe(
+                    plan.room_frame(), width="stretch", hide_index=True,
+                    height=min(560, 60 + 35 * len(plan.room)),
+                    column_config={
+                        "Odds": st.column_config.ProgressColumn(
+                            "Odds of that player", min_value=0.0, max_value=1.0,
+                            format="%.0f%%",
+                        ),
+                    },
+                )
 
 st.divider()
 

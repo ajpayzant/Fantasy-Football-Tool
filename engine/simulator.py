@@ -6,10 +6,11 @@ have very different costs:
 1. :class:`DraftSimulator` — advances a real :class:`~engine.draft_state.DraftState`
    one AI pick at a time. This is the thing the interactive UI drives: it never
    guesses, it commits, and it records why each pick happened.
-2. :func:`simulate_availability` — "will he still be there at my next pick?"
-   answered by rolling *copies* of the board forward through the same pick model
-   and counting. This replaces the closed-form ADP approximation in
-   :func:`engine.pick_model.expected_survival` with the honest simulated answer.
+2. :func:`simulate_draft_plan` — "what should be there at my next two picks, and
+   who takes what in between?" answered by rolling *copies* of the board forward
+   through the same pick model and counting. This replaces the closed-form ADP
+   approximation in :func:`engine.pick_model.expected_survival` with the honest
+   simulated answer. :func:`simulate_availability` is the one-turn case of it.
 3. :func:`monte_carlo_draft` — "how do whole drafts from here tend to go?" Many
    complete drafts from the current state, summarised.
 
@@ -86,6 +87,41 @@ via ``extra_players``.
 MIN_SIMULATIONS: int = 1
 MAX_SIMULATIONS: int = 5_000
 """Guard rails. The ceiling exists so a bad config value cannot hang the UI."""
+
+PLAN_TURNS: int = 2
+"""How many of your own upcoming picks :func:`simulate_draft_plan` looks at.
+
+Two, because that is the shortest look-ahead that changes a decision: with one
+turn the only question is "take him or lose him", and it takes a second turn for
+"take the receiver now because the tight end lasts" to be expressible. Each extra
+turn roughly doubles the rollout cost and compounds the error — by the third turn
+the board has been guessed twenty-odd picks deep and the answer is not worth
+acting on.
+"""
+
+PLAN_ROOM_PLAYERS: int = 4
+"""Named players kept per intervening pick.
+
+A single pick's named-player distribution has a long tail of 2% guesses; past the
+fourth the names are noise dressed as information.
+"""
+
+PLAN_GONE_BY: float = 0.35
+"""Survival at or below which a plan calls a player gone by a turn.
+
+The same edge as :data:`engine.recommender.LAST_CHANCE_SURVIVAL`, deliberately:
+"now or never" has to mean one thing across the app, or the two panels of the
+draft room argue with each other about the same player.
+"""
+
+PLAN_LASTS: float = 0.65
+"""Survival at or above which a plan says a player will still be there.
+
+Looser than :data:`engine.recommender.SAFE_TO_WAIT_SURVIVAL` (0.80) because it is
+asked of a longer wait. Two turns out is twenty-odd picks in a 12-team league, and
+demanding 80% there would leave the list permanently empty — which reads as "wait
+for nobody" rather than the truth, "this is a two-in-three bet".
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +310,309 @@ class AvailabilityReport:
         if not frame.empty:
             frame = frame.sort_values("survival").reset_index(drop=True)
         return frame
+
+
+@dataclass(slots=True)
+class RoomPickForecast:
+    """What one specific pick between now and your turn is likely to become.
+
+    Aggregated from the same rollouts that produced the survival numbers, which is
+    the point: the players disappearing in one panel are disappearing *because* of
+    the picks in the other. Two independently simulated panels would let the app
+    tell a user "the tight ends are safe" beside "this manager takes a tight end".
+    """
+
+    overall_pick: int
+    round_label: str
+    draft_slot: int
+    manager_name: str
+    simulations: int = 0
+    before_turn: int = 1
+    """Which of your turns this pick falls before (1 = your very next one)."""
+    roster_so_far: str = ""
+    """What they have already drafted, e.g. ``"2 RB · 1 WR"`` — empty in round 1."""
+    tendency: str = ""
+    """A short tag for how they draft, from their modelled profile."""
+    position_shares: dict[Position, float] = field(default_factory=dict)
+    """Position → share of rollouts in which they spent this pick on it."""
+    player_shares: list[tuple[Player, float]] = field(default_factory=list)
+    """The players they took here, most frequent first, with each one's share."""
+
+    @property
+    def likeliest_position(self) -> Position | None:
+        if not self.position_shares:
+            return None
+        return max(self.position_shares.items(), key=lambda kv: kv[1])[0]
+
+    @property
+    def likeliest_player(self) -> Player | None:
+        return self.player_shares[0][0] if self.player_shares else None
+
+    @property
+    def position_summary(self) -> str:
+        """The positional distribution, biggest first — the honest headline.
+
+        Named players at a single pick are usually a scatter of 3% guesses, while
+        the position is often 60% certain. Leading with the position is leading with
+        the part the simulation actually knows.
+        """
+        ordered = sorted(self.position_shares.items(), key=lambda kv: -kv[1])
+        return " · ".join(
+            f"{position} {share:.0%}" for position, share in ordered[:4] if share >= 0.05
+        )
+
+    def describe(self) -> str:
+        position = self.likeliest_position
+        if position is None:
+            return f"Pick {self.overall_pick} ({self.manager_name}): no clear lean"
+        share = self.position_shares.get(position, 0.0)
+        player = self.likeliest_player
+        tail = f", most often {player.name}" if player is not None else ""
+        return (
+            f"Pick {self.overall_pick} ({self.manager_name}): {position} in "
+            f"{share:.0%} of rollouts{tail}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "overall_pick": self.overall_pick,
+            "round": self.round_label,
+            "draft_slot": self.draft_slot,
+            "manager_name": self.manager_name,
+            "before_turn": self.before_turn,
+            "roster_so_far": self.roster_so_far,
+            "tendency": self.tendency,
+            "likeliest_position": (
+                str(self.likeliest_position) if self.likeliest_position else None
+            ),
+            "position_shares": {
+                str(position): round(float(share), 4)
+                for position, share in self.position_shares.items()
+            },
+            "likely_players": [
+                {"player_name": player.name, "position": str(player.position),
+                 "share": round(float(share), 4)}
+                for player, share in self.player_shares
+            ],
+        }
+
+
+@dataclass(slots=True)
+class PlannedTurn:
+    """One of your own upcoming picks, with what the board looks like when it lands."""
+
+    turn: int
+    """1 = your next pick, 2 = the one after it."""
+    overall_pick: int
+    round_label: str
+    picks_until: int
+    """Picks by *other* managers between now and this turn."""
+    availability: AvailabilityReport
+
+    @property
+    def label(self) -> str:
+        return f"{self.round_label} (pick {self.overall_pick})"
+
+    def expected_best(
+        self, *, minimum: float = 0.60, limit: int = 8
+    ) -> list[PlayerAvailability]:
+        """The best players on the board likely to reach this turn, best first.
+
+        "Best" is board order, the same ordering the rest of the app uses, rather
+        than "most likely to survive" — sorting by survival answers a different
+        question and puts the deepest sleeper on the board at the top.
+        """
+        keep = [
+            entry for entry in self.availability.players.values()
+            if entry.survival >= minimum
+        ]
+        return keep[:limit]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn": self.turn,
+            "overall_pick": self.overall_pick,
+            "round": self.round_label,
+            "picks_until": self.picks_until,
+            "simulations": self.availability.simulations,
+        }
+
+
+@dataclass(slots=True)
+class PlanWindows:
+    """The three groups a two-turn plan sorts the board into.
+
+    This is the whole point of looking two turns ahead rather than one. With one
+    turn the only question is "take him or lose him"; the second turn is what lets
+    a plan say "take the receiver now, the tight end will still be here" — which is
+    the sentence a drafter is actually trying to write.
+    """
+
+    take_now: list[PlayerAvailability] = field(default_factory=list)
+    """On the board now and unlikely to reach your next turn."""
+    next_turn: list[PlayerAvailability] = field(default_factory=list)
+    """Likely to reach your next turn but not the one after it."""
+    can_wait: list[PlayerAvailability] = field(default_factory=list)
+    """Likely to still be there two turns from now."""
+
+    @property
+    def is_empty(self) -> bool:
+        return not (self.take_now or self.next_turn or self.can_wait)
+
+
+@dataclass(slots=True)
+class DraftPlan:
+    """Two turns of look-ahead from one shared set of rollouts.
+
+    The question this answers is the one drafters actually ask: not "will he last
+    to my next pick", but "which of these two can I get later, so I take the other
+    one now". It has to come from a single simulation to be coherent — the second
+    turn's numbers are conditional on the first turn's picks having happened.
+
+    The stand-in pick the model makes on the user's behalf at the intervening turn
+    is excluded from survival counting, exactly as it is for the on-the-clock case
+    in :func:`simulate_availability`. So the second turn's survival reads as "the
+    room leaves him alone that long", which is the only part the user does not
+    control; whoever they actually take at the first turn is obviously gone.
+    """
+
+    draft_slot: int = 0
+    from_pick: int = 0
+    simulations: int = 0
+    elapsed_seconds: float = 0.0
+    turns: list[PlannedTurn] = field(default_factory=list)
+    room: list[RoomPickForecast] = field(default_factory=list)
+    """Every intervening pick by another manager, in board order."""
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.turns
+
+    def turn(self, number: int) -> PlannedTurn | None:
+        """Your ``number``-th upcoming pick (1-based), or ``None``."""
+        for planned in self.turns:
+            if planned.turn == int(number):
+                return planned
+        return None
+
+    @property
+    def first_report(self) -> AvailabilityReport | None:
+        """The next turn's availability, reusable by the recommendation engine."""
+        return self.turns[0].availability if self.turns else None
+
+    def survival(self, player_id: str, turn: int = 1, default: float = 1.0) -> float:
+        planned = self.turn(turn)
+        return planned.availability.survival(player_id, default) if planned else default
+
+    def room_before(self, turn: int) -> list[RoomPickForecast]:
+        return [entry for entry in self.room if entry.before_turn == int(turn)]
+
+    def windows(
+        self,
+        *,
+        limit: int = 6,
+        gone_by: float = PLAN_GONE_BY,
+        lasts: float = PLAN_LASTS,
+    ) -> PlanWindows:
+        """Sort the board into take-now, next-turn and can-wait, best first.
+
+        Board order is preserved and each group is capped at ``limit``, so what a
+        user reads is "the best few players in each case" rather than a hundred deep
+        sleepers who were never going anywhere.
+
+        With only one turn to plan for, ``next_turn`` and ``can_wait`` collapse into
+        one question and everything not at risk lands in ``can_wait``: a single-turn
+        plan cannot honestly distinguish them, and inventing the distinction is
+        worse than omitting it.
+        """
+        first = self.turn(1)
+        if first is None:
+            return PlanWindows()
+        second = self.turn(2)
+        windows = PlanWindows()
+        for player_id, entry in first.availability.players.items():
+            if entry.survival <= gone_by:
+                if len(windows.take_now) < limit:
+                    windows.take_now.append(entry)
+                continue
+            if second is None:
+                if entry.survival >= lasts and len(windows.can_wait) < limit:
+                    windows.can_wait.append(entry)
+                continue
+            later = second.availability.get(player_id)
+            survival_later = later.survival if later is not None else 1.0
+            if survival_later <= gone_by:
+                if len(windows.next_turn) < limit:
+                    windows.next_turn.append(later or entry)
+            elif survival_later >= lasts and len(windows.can_wait) < limit:
+                windows.can_wait.append(later or entry)
+        return windows
+
+    def to_frame(self):
+        """One row per tracked player, one survival column per turn.
+
+        Board order is preserved, so the first rows are the best players left and
+        the table reads top-down as "here is what should still be there".
+        """
+        import pandas as pd
+
+        first = self.turns[0] if self.turns else None
+        if first is None:
+            return pd.DataFrame()
+        rows = []
+        for player_id, entry in first.availability.players.items():
+            row: dict[str, Any] = {
+                "Player": entry.player.name,
+                "Pos": str(entry.player.position),
+                "Team": entry.player.nfl_team or "FA",
+                "ADP": entry.player.overall_adp,
+            }
+            for planned in self.turns:
+                own = planned.availability.get(player_id)
+                row[f"Pick {planned.overall_pick}"] = (
+                    float(own.survival) if own is not None else 1.0
+                )
+            row["Most likely taken by"] = entry.likeliest_taker or "—"
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def room_frame(self):
+        import pandas as pd
+
+        # Name the turn each pick comes before rather than its index — "before your
+        # 4.07 (pick 43)" is readable on its own, "before your 1" is not.
+        labels = {planned.turn: planned.label for planned in self.turns}
+        return pd.DataFrame([
+            {
+                "Pick": entry.overall_pick,
+                "Round": entry.round_label,
+                "Manager": entry.manager_name,
+                "Likely position": entry.position_summary or "—",
+                "Most likely player": (
+                    entry.likeliest_player.name
+                    if entry.likeliest_player is not None else "—"
+                ),
+                "Odds": (
+                    entry.player_shares[0][1] if entry.player_shares else None
+                ),
+                "Roster so far": entry.roster_so_far or "—",
+                "How they draft": entry.tendency or "—",
+                "Before your pick": labels.get(
+                    entry.before_turn, f"#{entry.before_turn}"
+                ),
+            }
+            for entry in self.room
+        ])
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "draft_slot": self.draft_slot,
+            "from_pick": self.from_pick,
+            "simulations": self.simulations,
+            "elapsed_seconds": round(float(self.elapsed_seconds), 3),
+            "turns": [planned.to_dict() for planned in self.turns],
+            "room": [entry.to_dict() for entry in self.room],
+        }
 
 
 @dataclass(slots=True)
@@ -516,6 +855,8 @@ class _Horizon:
     target_pick: int
     on_clock: bool
     """True when the slot being asked about is the one currently picking."""
+    turns_ahead: int = 1
+    """Which of the slot's own turns this measures to (1 = its next one)."""
 
     @property
     def rollout_picks(self) -> int:
@@ -523,34 +864,54 @@ class _Horizon:
         return max(0, self.target_pick - self.from_pick)
 
     @property
+    def own_turns_passed(self) -> int:
+        """The slot's *own* turns the rollout must play through to get here.
+
+        One for the pick it is deciding right now, plus one for each earlier turn
+        of its own between then and the target. These are the picks a rollout has
+        to make on the slot's behalf, and they are the picks excluded when
+        survival is counted.
+        """
+        return (1 if self.on_clock else 0) + max(0, int(self.turns_ahead) - 1)
+
+    @property
     def gap(self) -> int:
         """Picks by *other* managers before the target pick — the honest wait."""
-        return max(0, self.rollout_picks - (1 if self.on_clock else 0))
+        return max(0, self.rollout_picks - self.own_turns_passed)
 
     @property
     def is_empty(self) -> bool:
         return self.rollout_picks <= 0
 
 
-def _horizon_for(state: DraftState, draft_slot: int) -> _Horizon | None:
+def _horizon_for(
+    state: DraftState, draft_slot: int, *, turns_ahead: int = 1
+) -> _Horizon | None:
     """Resolve the wait a slot faces, or ``None`` when it has no picks left.
 
     For the slot on the clock this skips the pick they are deciding right now and
     measures to the one after it: "will he last until I pick again" is the only
     version of the question with a non-trivial answer.
+
+    ``turns_ahead`` looks further down the board: 2 measures to the turn *after*
+    the next one, which is what plans a pair of picks together ("take the receiver
+    now, the tight end lasts"). ``None`` once the slot runs out of turns, so a
+    caller asking for two horizons late in the draft gets one.
     """
     current = state.current_slot
     if current is None:
         return None
-    upcoming = state.next_pick_numbers(int(draft_slot), count=2)
+    wanted = max(1, int(turns_ahead))
+    upcoming = state.next_pick_numbers(int(draft_slot), count=wanted + 1)
     on_clock = current.draft_slot == int(draft_slot)
     horizon = upcoming[1:] if on_clock else upcoming
-    if not horizon:
+    if len(horizon) < wanted:
         return None
     return _Horizon(
         from_pick=int(current.overall_pick),
-        target_pick=int(horizon[0]),
+        target_pick=int(horizon[wanted - 1]),
         on_clock=on_clock,
+        turns_ahead=wanted,
     )
 
 
@@ -574,6 +935,7 @@ def _roll_forward(
     user's **next** pick, the rollout has to get past the pick they are currently
     deciding, which means letting the model take a player on their behalf. That
     selection is excluded when survival is counted, so it cannot bias the answer.
+    A two-turn plan uses it the same way for the turn in between.
     """
     clone = state.copy_for_simulation()
     remaining_skips = max(0, int(skip_stops))
@@ -596,6 +958,293 @@ def _roll_forward(
             break
         clone.make_pick(chosen.player, is_user_pick=False)
     return clone
+
+
+def _gone_from(
+    picks: Iterable[Pick], tracked: Mapping[str, Player], own_slot: int
+) -> dict[str, Pick]:
+    """Tracked players taken during a rollout, keyed by player id.
+
+    Picks made by ``own_slot`` are ignored. Those are the stand-in selections the
+    rollout makes on the user's behalf to get past their own turns, and they are not
+    competition: counting them would report every player the model likes as unlikely
+    to survive, when the user is free to simply take him.
+    """
+    gone: dict[str, Pick] = {}
+    for pick in picks:
+        if pick.draft_slot == int(own_slot):
+            continue
+        if pick.player_id in tracked:
+            gone[pick.player_id] = pick
+    return gone
+
+
+def _roster_shorthand(state: DraftState, draft_slot: int) -> str:
+    """What a slot has drafted so far, as ``"2 RB · 1 WR"``, most-drafted first.
+
+    Half of "who will they take" is "what do they already have", and a plan that
+    showed the prediction without the roster behind it would be asking the user to
+    take the model's word for it.
+    """
+    counts: Counter[Position] = Counter(
+        pick.position for pick in state.picks_by_slot(int(draft_slot))
+    )
+    if not counts:
+        return ""
+    return " · ".join(f"{count} {position}" for position, count in counts.most_common())
+
+
+def _tendency_tag(profile: ManagerProfile | None) -> str:
+    """A few words on how a manager drafts, sized for a table cell.
+
+    :meth:`models.manager.ManagerProfile.describe` is the full paragraph and belongs
+    on the Manager Profiles page. What a planning table needs is the two or three
+    traits that explain the prediction sitting beside them.
+    """
+    if profile is None:
+        return ""
+    tags: list[str] = []
+    lean = max(
+        (
+            (position, float(profile.position_bias.get(position, 0.0)))
+            for position in (Position.RB, Position.WR, Position.TE, Position.QB)
+        ),
+        key=lambda item: abs(item[1]),
+        default=None,
+    )
+    if lean is not None and abs(lean[1]) >= 0.08:
+        tags.append(f"{lean[0]} {'early' if lean[1] > 0 else 'late'}")
+    reach = profile.reach_mean
+    if reach >= 3:
+        tags.append(f"reaches ~{reach:.0f}")
+    elif reach <= -3:
+        tags.append(f"waits ~{abs(reach):.0f}")
+    else:
+        tags.append("near ADP")
+    if profile.predictability >= 0.70:
+        tags.append("predictable")
+    elif profile.predictability <= 0.32:
+        tags.append("erratic")
+    return " · ".join(tags)
+
+
+def simulate_draft_plan(
+    state: DraftState,
+    profiles: Mapping[int, ManagerProfile],
+    *,
+    draft_slot: int | None = None,
+    turns: int = PLAN_TURNS,
+    simulations: int | None = None,
+    extra_players: Iterable[Player] | None = None,
+    track_limit: int = AVAILABILITY_TRACK_LIMIT,
+    seed: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> DraftPlan:
+    """Roll the board forward through ``draft_slot``'s next ``turns`` turns.
+
+    The engine behind the two-pick plan, and the single source of every survival
+    number in the app: :func:`simulate_availability` is this function with
+    ``turns=1``. One implementation because the counting rule is subtle — which
+    picks are competition, which are the user's own stand-ins, and what "gap" means
+    for whoever is on the clock — and two copies of it would drift.
+
+    Each rollout is run as one continuous draft, stopping at each of the slot's
+    turns in order to snapshot the board before carrying on. That is what makes the
+    second turn's numbers *conditional*: the managers picking between the two turns
+    have seen the first turn happen, so a run on tight ends that the first pick
+    triggers is priced into the second.
+
+    Everything the caller asked about is derived from those same rollouts — survival
+    per turn, and a per-pick forecast of what each intervening manager does — so no
+    two panels of the UI can disagree about one simulated draft.
+
+    ``progress`` is called as ``(completed, total)`` once per rollout, not once per
+    turn, so a progress bar advances evenly; it is never called from a thread.
+    """
+    started = time.perf_counter()
+    settings = state.settings
+    runs = _clamp_simulations(
+        simulations if simulations is not None else settings.availability_simulations
+    )
+    current = state.current_slot
+    if current is None:
+        return DraftPlan()
+    target_slot = int(
+        draft_slot if draft_slot is not None
+        else (next(iter(sorted(state.league.user_slots)), current.draft_slot))
+    )
+    from_pick = int(current.overall_pick)
+    plan = DraftPlan(draft_slot=target_slot, from_pick=from_pick)
+
+    # Ask for turns one at a time and stop at the first one that does not exist:
+    # in the last round there is no second turn to plan for, and reporting one
+    # turn is the right answer rather than an error.
+    horizons: list[_Horizon] = []
+    for ahead in range(1, max(1, int(turns)) + 1):
+        horizon = _horizon_for(state, target_slot, turns_ahead=ahead)
+        if horizon is None or horizon.is_empty:
+            break
+        horizons.append(horizon)
+    if not horizons:
+        plan.elapsed_seconds = time.perf_counter() - started
+        return plan
+
+    tracked: dict[str, Player] = {
+        p.player_id: p for p in state.available_players(limit=max(1, int(track_limit)))
+    }
+    for player in extra_players or ():
+        if state.is_available(player.player_id):
+            tracked.setdefault(player.player_id, player)
+    position_pool: dict[Position, int] = {}
+    for player in tracked.values():
+        position_pool[player.position] = position_pool.get(player.position, 0) + 1
+
+    # Book-keeping, index-aligned with ``horizons``: one set per turn.
+    survived: list[Counter[str]] = [Counter() for _ in horizons]
+    taken_pick_total: list[Counter[str]] = [Counter() for _ in horizons]
+    taken_count: list[Counter[str]] = [Counter() for _ in horizons]
+    taken_by: list[dict[str, Counter[str]]] = [{} for _ in horizons]
+    position_taken: list[dict[Position, int]] = [{} for _ in horizons]
+    # And one set per intervening pick, keyed by its overall pick number. The draft
+    # order is fixed, so pick 34 is the same manager's pick in every rollout and the
+    # counts across rollouts are comparable.
+    room_positions: dict[int, Counter[Position]] = {}
+    room_players: dict[int, Counter[str]] = {}
+    room_managers: dict[int, tuple[int, str]] = {}
+
+    # A slot that turns the snake picks again immediately, so nothing intervenes and
+    # everyone available survives by definition. Report that rather than running
+    # rollouts that cannot change the answer.
+    live = any(horizon.gap > 0 for horizon in horizons)
+    completed = runs if (live and tracked) else 0
+    baseline = len(state.picks)
+
+    if completed:
+        rng = random.Random(seed if seed is not None else state.rng.random())
+        for run_index in range(completed):
+            clone = state
+            leg_start = from_pick
+            for index, horizon in enumerate(horizons):
+                clone = _roll_forward(
+                    clone, profiles, horizon.target_pick - leg_start, rng,
+                    stop_at_slot=target_slot,
+                    # Leg one has to get past the pick the user is deciding right
+                    # now, if it is theirs. Every later leg starts *at* one of their
+                    # turns and has to play through it.
+                    skip_stops=(1 if horizon.on_clock else 0) if index == 0 else 1,
+                )
+                leg_start = horizon.target_pick
+                # Survival to a later turn includes everyone taken in the earlier
+                # legs, so each turn reads the whole rollout so far rather than its
+                # own leg. Only picks made during this rollout count: picks already
+                # on the board when it started are not attributed to it.
+                gone = _gone_from(clone.picks[baseline:], tracked, target_slot)
+                for pid, player in tracked.items():
+                    pick = gone.get(pid)
+                    if pick is None:
+                        survived[index][pid] += 1
+                        continue
+                    taken_pick_total[index][pid] += int(pick.overall_pick)
+                    taken_count[index][pid] += 1
+                    taken_by[index].setdefault(pid, Counter())[pick.manager_name] += 1
+                    position_taken[index][player.position] = (
+                        position_taken[index].get(player.position, 0) + 1
+                    )
+            for pick in clone.picks[baseline:]:
+                if pick.draft_slot == target_slot:
+                    continue
+                room_positions.setdefault(
+                    pick.overall_pick, Counter()
+                )[pick.position] += 1
+                room_players.setdefault(
+                    pick.overall_pick, Counter()
+                )[pick.player_id] += 1
+                room_managers[pick.overall_pick] = (pick.draft_slot, pick.manager_name)
+            if progress is not None:
+                progress(run_index + 1, completed)
+
+    slots_by_pick = {slot.overall_pick: slot for slot in state.order}
+    elapsed = time.perf_counter() - started
+    for index, horizon in enumerate(horizons):
+        # A zero-gap turn reports zero simulations because none were needed, not
+        # because the answer is unknown: survival is 1.0 for everyone.
+        counted = completed if horizon.gap > 0 else 0
+        players = {
+            pid: PlayerAvailability(
+                player=player,
+                survival=(survived[index][pid] / completed) if completed else 1.0,
+                simulations=counted,
+                picks_until_next=int(horizon.gap),
+                target_pick=horizon.target_pick,
+                mean_pick_taken=(
+                    taken_pick_total[index][pid] / taken_count[index][pid]
+                    if taken_count[index][pid] else None
+                ),
+                taken_by=dict(taken_by[index].get(pid, {})),
+            )
+            for pid, player in tracked.items()
+        }
+        target = slots_by_pick.get(horizon.target_pick)
+        plan.turns.append(PlannedTurn(
+            turn=index + 1,
+            overall_pick=horizon.target_pick,
+            round_label=target.label if target is not None else str(horizon.target_pick),
+            picks_until=int(horizon.gap),
+            availability=AvailabilityReport(
+                players=players,
+                simulations=counted,
+                picks_until_next=int(horizon.gap),
+                target_pick=horizon.target_pick,
+                from_pick=from_pick,
+                elapsed_seconds=elapsed,
+                position_gone={
+                    position: position_taken[index].get(position, 0) / (completed * count)
+                    for position, count in position_pool.items() if count
+                } if counted else {},
+            ),
+        ))
+
+    for overall_pick in sorted(room_positions):
+        pick_slot = slots_by_pick.get(overall_pick)
+        slot_number, manager_name = room_managers[overall_pick]
+        likely: list[tuple[Player, float]] = []
+        for player_id, count in room_players[overall_pick].most_common(
+            PLAN_ROOM_PLAYERS
+        ):
+            player = state.pool.get(player_id)
+            if player is not None:
+                likely.append((player, count / completed))
+        plan.room.append(RoomPickForecast(
+            overall_pick=int(overall_pick),
+            round_label=pick_slot.label if pick_slot is not None else str(overall_pick),
+            draft_slot=int(slot_number),
+            manager_name=manager_name,
+            simulations=completed,
+            before_turn=next(
+                (
+                    index + 1 for index, horizon in enumerate(horizons)
+                    if overall_pick < horizon.target_pick
+                ),
+                len(horizons),
+            ),
+            roster_so_far=_roster_shorthand(state, slot_number),
+            tendency=_tendency_tag(profiles.get(int(slot_number))),
+            position_shares={
+                position: count / completed
+                for position, count in room_positions[overall_pick].items()
+            },
+            player_shares=likely,
+        ))
+
+    plan.simulations = completed
+    plan.elapsed_seconds = time.perf_counter() - started
+    LOGGER.info(
+        "Draft plan: %d rollouts to slot %d's next %d turn(s) (picks %s) in %.2fs",
+        completed, target_slot, len(horizons),
+        ", ".join(str(horizon.target_pick) for horizon in horizons),
+        plan.elapsed_seconds,
+    )
+    return plan
 
 
 def simulate_availability(
@@ -623,127 +1272,26 @@ def simulate_availability(
 
     ``progress`` is called as ``(completed, total)`` after each rollout so a UI
     can show a bar; it is never called from a thread.
+
+    One turn of :func:`simulate_draft_plan`, which is where the rollout and counting
+    rules live. Callers wanting the pick after this one should ask that function for
+    both at once: it costs one set of rollouts instead of two, and the two answers
+    are then consistent with each other.
     """
-    started = time.perf_counter()
-    settings = state.settings
-    runs = _clamp_simulations(
-        simulations if simulations is not None else settings.availability_simulations
+    plan = simulate_draft_plan(
+        state, profiles,
+        draft_slot=draft_slot, turns=1, simulations=simulations,
+        extra_players=extra_players, track_limit=track_limit, seed=seed,
+        progress=progress,
     )
-
-    current = state.current_slot
-    if current is None:
-        return AvailabilityReport(simulations=0, elapsed_seconds=0.0)
-    target_slot = int(
-        draft_slot if draft_slot is not None
-        else (next(iter(sorted(state.league.user_slots)), current.draft_slot))
+    report = plan.first_report
+    if report is not None:
+        return report
+    # No further picks for this slot: nothing left to wait for.
+    return AvailabilityReport(
+        simulations=0, picks_until_next=0, target_pick=plan.from_pick,
+        from_pick=plan.from_pick, elapsed_seconds=plan.elapsed_seconds,
     )
-    from_pick = int(current.overall_pick)
-    horizon = _horizon_for(state, target_slot)
-    if horizon is None or horizon.is_empty:
-        # No further picks for this slot: nothing left to wait for.
-        return AvailabilityReport(
-            simulations=0, picks_until_next=0, target_pick=from_pick,
-            from_pick=from_pick, elapsed_seconds=time.perf_counter() - started,
-        )
-    target_pick = horizon.target_pick
-    gap = horizon.gap
-    on_clock = horizon.on_clock
-
-    tracked: dict[str, Player] = {
-        p.player_id: p for p in state.available_players(limit=max(1, int(track_limit)))
-    }
-    for player in extra_players or ():
-        if state.is_available(player.player_id):
-            tracked.setdefault(player.player_id, player)
-
-    if gap <= 0 or not tracked:
-        # Already on the clock: everyone available survives by definition. Report
-        # that rather than running rollouts that cannot change anything.
-        return AvailabilityReport(
-            players={
-                pid: PlayerAvailability(
-                    player=player, survival=1.0, simulations=0,
-                    picks_until_next=0, target_pick=target_pick,
-                )
-                for pid, player in tracked.items()
-            },
-            simulations=0,
-            picks_until_next=0,
-            target_pick=target_pick,
-            from_pick=from_pick,
-            elapsed_seconds=time.perf_counter() - started,
-        )
-
-    rng = random.Random(seed if seed is not None else state.rng.random())
-    survived: Counter[str] = Counter()
-    taken_pick_total: Counter[str] = Counter()
-    taken_count: Counter[str] = Counter()
-    taken_by: dict[str, Counter[str]] = {}
-    position_taken: dict[Position, int] = {}
-    position_pool: dict[Position, int] = {}
-    for player in tracked.values():
-        position_pool[player.position] = position_pool.get(player.position, 0) + 1
-
-    for run_index in range(runs):
-        clone = _roll_forward(
-            state, profiles, horizon.rollout_picks, rng,
-            stop_at_slot=target_slot,
-            skip_stops=1 if on_clock else 0,
-        )
-        # Which tracked players went, and to whom. Only picks made *during* this
-        # rollout count, so picks already on the board are not attributed to it.
-        gone: dict[str, Pick] = {}
-        for pick in clone.picks[len(state.picks):]:
-            # The stand-in pick made on the user's own behalf is not competition
-            # for them — counting it would report every player the model likes as
-            # unlikely to survive, when the user is free to simply take him now.
-            if on_clock and pick.draft_slot == target_slot:
-                continue
-            if pick.player_id in tracked:
-                gone[pick.player_id] = pick
-        for pid, player in tracked.items():
-            pick = gone.get(pid)
-            if pick is None:
-                survived[pid] += 1
-                continue
-            taken_pick_total[pid] += int(pick.overall_pick)
-            taken_count[pid] += 1
-            taken_by.setdefault(pid, Counter())[pick.manager_name] += 1
-            position_taken[player.position] = position_taken.get(player.position, 0) + 1
-        if progress is not None:
-            progress(run_index + 1, runs)
-
-    players = {
-        pid: PlayerAvailability(
-            player=player,
-            survival=survived[pid] / runs,
-            simulations=runs,
-            picks_until_next=int(gap),
-            target_pick=target_pick,
-            mean_pick_taken=(
-                taken_pick_total[pid] / taken_count[pid] if taken_count[pid] else None
-            ),
-            taken_by=dict(taken_by.get(pid, {})),
-        )
-        for pid, player in tracked.items()
-    }
-    report = AvailabilityReport(
-        players=players,
-        simulations=runs,
-        picks_until_next=int(gap),
-        target_pick=target_pick,
-        from_pick=from_pick,
-        elapsed_seconds=time.perf_counter() - started,
-        position_gone={
-            position: position_taken.get(position, 0) / (runs * count)
-            for position, count in position_pool.items() if count
-        },
-    )
-    LOGGER.info(
-        "Availability: %d rollouts over %d picks (slot %d, pick %d) in %.2fs",
-        runs, gap, target_slot, target_pick, report.elapsed_seconds,
-    )
-    return report
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -991,6 +1539,9 @@ def likely_next_picks(
 __all__ = [
     "DraftSimulator", "SimulatedPick", "PlayerAvailability", "AvailabilityReport",
     "SimulatedDraftResult", "MonteCarloReport", "simulate_availability",
+    "DraftPlan", "PlannedTurn", "PlanWindows", "RoomPickForecast",
+    "simulate_draft_plan",
     "monte_carlo_draft", "upcoming_position_pressure", "likely_next_picks",
     "RISK_BAND_EDGES", "AVAILABILITY_TRACK_LIMIT", "ALTERNATIVES_RECORDED",
+    "PLAN_TURNS", "PLAN_ROOM_PLAYERS", "PLAN_GONE_BY", "PLAN_LASTS",
 ]

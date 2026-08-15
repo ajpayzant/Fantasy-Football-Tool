@@ -25,6 +25,8 @@ from core.validation import ConfigurationError
 from engine.draft_state import DraftState
 from engine.opponent_model import build_profiles
 from engine.simulator import (
+    PLAN_GONE_BY,
+    PLAN_LASTS,
     RISK_BAND_EDGES,
     AvailabilityReport,
     DraftSimulator,
@@ -33,6 +35,7 @@ from engine.simulator import (
     likely_next_picks,
     monte_carlo_draft,
     simulate_availability,
+    simulate_draft_plan,
     upcoming_position_pressure,
 )
 from models.league import League
@@ -132,6 +135,46 @@ class TestHorizon:
         while not state.is_complete:
             state.make_pick(state.best_available())
         assert _horizon_for(state, 1) is None
+
+    def test_two_turns_ahead_measures_to_the_pick_after_the_next_one(
+        self, state: DraftState
+    ) -> None:
+        """Slot 5 picks 5th and 12th in an eight-team snake."""
+        horizon = _horizon_for(state, 5, turns_ahead=2)
+        assert horizon.target_pick == 12
+        # Its own turn at pick 5 has to be played through to reach pick 12, and that
+        # pick is not competition, so the honest wait is ten managers rather than 11.
+        assert horizon.own_turns_passed == 1
+        assert horizon.rollout_picks == 11
+        assert horizon.gap == 10
+
+    def test_the_slot_on_the_clock_counts_both_of_its_own_turns(
+        self, state: DraftState
+    ) -> None:
+        """Slot 1 picks 1st, 16th and 17th — it turns the snake, so 16 and 17 adjoin.
+
+        Both of those are its own picks, so a two-turn plan waits on exactly the same
+        14 opponents as a one-turn plan. Getting this wrong by one would price the
+        second turn as if a stranger picked at 16.
+        """
+        horizon = _horizon_for(state, 1, turns_ahead=2)
+        assert horizon.target_pick == 17
+        assert horizon.own_turns_passed == 2
+        assert horizon.rollout_picks == 16
+        assert horizon.gap == 14
+
+    def test_a_slot_with_one_pick_left_has_no_second_turn(
+        self, state: DraftState
+    ) -> None:
+        """Asking for two turns in the last round must answer honestly, not guess.
+
+        Slot 3 picks 3, 14, 19, 30, 35 and 46 here, so from pick 41 there is exactly
+        one turn left to plan for.
+        """
+        while state.pick_index < 40:
+            state.make_pick(state.best_available())
+        assert _horizon_for(state, USER_SLOT, turns_ahead=1).target_pick == 46
+        assert _horizon_for(state, USER_SLOT, turns_ahead=2) is None
 
     def test_the_pick_model_now_sees_a_real_gap(
         self, state: DraftState, profiles: dict[int, ManagerProfile]
@@ -369,6 +412,245 @@ class TestSimulateAvailability:
         report = AvailabilityReport(simulations=10)
         assert report.survival("nobody") == 1.0
         assert report.band("nobody") is RiskBand.SAFE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The two-turn plan
+#
+# The properties here are the ones that make a plan trustworthy rather than merely
+# plausible. A second horizon is easy to produce and easy to get subtly wrong: the
+# arithmetic can double-count the user's own turn, the second turn can be computed
+# from a board that never saw the first turn happen, and a rollout that drafts on
+# the user's behalf can quietly report their own best pick as "gone".
+# ─────────────────────────────────────────────────────────────────────────────
+FAST_PLAN_SIMS = 12
+
+
+class TestSimulateDraftPlan:
+    def test_both_turns_come_from_one_pass_over_the_board(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Slot 3 picks 3rd and 14th, and the plan reports them in order."""
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        assert [turn.turn for turn in plan.turns] == [1, 2]
+        assert [turn.overall_pick for turn in plan.turns] == [3, 14]
+        assert [turn.picks_until for turn in plan.turns] == [2, 12]
+        assert plan.simulations == FAST_PLAN_SIMS
+        assert plan.first_report is plan.turns[0].availability
+
+    def test_survival_never_rises_between_your_turns(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """The invariant that proves the turns share one simulated draft.
+
+        A player taken before the first turn cannot reappear before the second. If
+        the two turns were simulated independently this would fail intermittently,
+        and the plan would be able to advise waiting for a player it had already
+        reported gone.
+        """
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        first, second = plan.turn(1), plan.turn(2)
+        assert first is not None and second is not None
+        for player_id in first.availability.players:
+            assert (
+                second.availability.survival(player_id)
+                <= first.availability.survival(player_id) + 1e-9
+            )
+
+    def test_the_room_is_every_intervening_pick_but_none_of_yours(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Picks 1-2 and 4-13, with the user's own pick 3 absent.
+
+        The user's turn is excluded because the model's stand-in choice there is not
+        a prediction of anything — the user is about to make it themselves.
+        """
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        picks = [forecast.overall_pick for forecast in plan.room]
+        assert picks == [1, 2] + list(range(4, 14))
+        assert all(forecast.draft_slot != USER_SLOT for forecast in plan.room)
+        assert [f.overall_pick for f in plan.room_before(1)] == [1, 2]
+        assert [f.overall_pick for f in plan.room_before(2)] == list(range(4, 14))
+
+    def test_a_forecast_pick_is_a_distribution_over_positions(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        forecast = plan.room[0]
+        assert forecast.simulations == FAST_PLAN_SIMS
+        assert sum(forecast.position_shares.values()) == pytest.approx(1.0)
+        assert forecast.likeliest_position in forecast.position_shares
+        shares = [share for _, share in forecast.player_shares]
+        assert shares == sorted(shares, reverse=True)
+        assert all(0.0 < share <= 1.0 for share in shares)
+        assert forecast.likeliest_player is forecast.player_shares[0][0]
+
+    def test_a_forecast_shows_the_evidence_behind_it(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """What they already drafted and how they draft, not just the prediction."""
+        while state.pick_index < 10:
+            state.make_pick(state.best_available())
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        assert plan.room
+        assert all(forecast.tendency for forecast in plan.room)
+        # Ten picks in, everyone in the room owns at least one player.
+        assert all(forecast.roster_so_far for forecast in plan.room)
+
+    def test_one_turn_is_exactly_what_simulate_availability_reports(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """The refactor's contract: the old entry point is the new one, turns=1.
+
+        Same seed, same rollouts, same numbers — not "close enough". If this drifts,
+        every survival figure in the app changed meaning without anyone deciding to
+        change it.
+        """
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=1, turns=1, simulations=10, seed=5,
+        )
+        report = simulate_availability(
+            state, profiles, draft_slot=1, simulations=10, seed=5,
+        )
+        assert {k: v.survival for k, v in plan.first_report.players.items()} == {
+            k: v.survival for k, v in report.players.items()
+        }
+
+    def test_the_plan_leaves_the_live_draft_untouched(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        before, available = len(state.picks), state.available_count()
+        simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT, simulations=5, seed=4
+        )
+        assert len(state.picks) == before
+        assert state.available_count() == available
+        assert state.can_undo is False
+
+    def test_progress_counts_rollouts_rather_than_turns(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Two turns per rollout must not make the bar reach 200%."""
+        seen: list[tuple[int, int]] = []
+        simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT, simulations=6,
+            progress=lambda done, total: seen.append((done, total)),
+        )
+        assert seen == [(i, 6) for i in range(1, 7)]
+
+    def test_your_own_stand_in_pick_is_never_reported_as_competition(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """The rollout drafts for the user at their first turn to reach the second.
+
+        That selection must not appear as a taker at either turn, or the plan would
+        tell the user a player is gone because the model took him on their behalf.
+        """
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        mine = f"Manager {USER_SLOT}"
+        for turn in plan.turns:
+            for entry in turn.availability.players.values():
+                assert mine not in entry.taken_by
+
+    def test_the_last_round_plans_the_one_turn_that_is_left(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        while state.pick_index < 40:
+            state.make_pick(state.best_available())
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT, simulations=6, seed=4
+        )
+        assert [turn.overall_pick for turn in plan.turns] == [46]
+        assert plan.turn(2) is None
+        # And the windows collapse to two groups rather than inventing a third.
+        assert not plan.windows().next_turn
+
+    def test_a_finished_draft_plans_nothing(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        while not state.is_complete:
+            state.make_pick(state.best_available())
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT, simulations=6
+        )
+        assert plan.is_empty
+        assert plan.turns == [] and plan.room == []
+        assert plan.windows().is_empty
+
+    def test_the_windows_sort_the_board_by_the_decision(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Each group has to mean what it says, since the labels drive the advice."""
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        windows = plan.windows(limit=4)
+        first, second = plan.turn(1), plan.turn(2)
+        assert all(len(group) <= 4 for group in (
+            windows.take_now, windows.next_turn, windows.can_wait
+        ))
+        for entry in windows.take_now:
+            assert first.availability.survival(entry.player_id) <= PLAN_GONE_BY
+        for entry in windows.next_turn:
+            assert first.availability.survival(entry.player_id) > PLAN_GONE_BY
+            assert second.availability.survival(entry.player_id) <= PLAN_GONE_BY
+        for entry in windows.can_wait:
+            assert second.availability.survival(entry.player_id) >= PLAN_LASTS
+        # No player can be in two groups: the three are a partition, not three views.
+        grouped = [
+            entry.player_id for group in
+            (windows.take_now, windows.next_turn, windows.can_wait)
+            for entry in group
+        ]
+        assert len(grouped) == len(set(grouped))
+
+    def test_the_frame_carries_a_column_per_turn(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT,
+            simulations=FAST_PLAN_SIMS, seed=4,
+        )
+        frame = plan.to_frame()
+        assert list(frame.columns)[:4] == ["Player", "Pos", "Team", "ADP"]
+        assert "Pick 3" in frame.columns and "Pick 14" in frame.columns
+        # Board order, so the table reads as "the best players left" top-down.
+        assert frame.iloc[0]["Player"] == state.available_players(limit=1)[0].name
+        room = plan.room_frame()
+        assert len(room) == len(plan.room)
+        assert set(room["Pick"]) == {f.overall_pick for f in plan.room}
+
+    def test_a_sleeper_the_user_names_is_tracked_at_both_turns(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """``extra_players`` is how the user's own board reaches the rollouts."""
+        deep = state.available_players()[-1]
+        plan = simulate_draft_plan(
+            state, profiles, draft_slot=USER_SLOT, simulations=6,
+            extra_players=[deep], track_limit=10, seed=4,
+        )
+        for turn in plan.turns:
+            assert turn.availability.get(deep.player_id) is not None
+            assert turn.availability.survival(deep.player_id) == 1.0
 
 
 def _availability(survival: float, simulations: int = 100) -> PlayerAvailability:

@@ -162,6 +162,14 @@ def test_draft_room_renders_and_recommends(loaded) -> None:
     assert "Best Overall" in text or "Best Roster Fit" in text, (
         "no recommendation lens rendered"
     )
+    # The two-turn plan renders from the same rollouts. Asserted because it is built
+    # from engine dataclasses and a DataFrame per turn: an empty plan would render as
+    # a clean page with the whole feature silently missing.
+    assert "Your next two picks" in text, "the look-ahead plan did not render"
+    assert any(
+        "Take now" in block.value or "Can wait" in block.value
+        for block in app.markdown
+    ), "the plan rendered no decision windows"
 
 
 def test_the_board_is_above_the_recommendations(loaded) -> None:

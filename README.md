@@ -143,7 +143,7 @@ of rosters you tend to end up with rather than one draft that happened to go wel
 | **2 · Player Pool** | The board, with provenance: which columns you supplied, which were **estimated** because they were missing, and how VOR was derived from your league's shape. Filters, sorting, CSV export, position charts. |
 | **My Board** | Your own rankings — upload a CSV/TSV/Excel file, paste a list, or rank players directly against the live board — plus your targets and never-draft list, and a table of where you disagree with the consensus. Only two things are read from a file, the names and the order; the projections in someone else's file stay theirs. Everything here changes what the app recommends **to you** and nothing else: the eleven opponents never see it, because a personal ranking is not a prediction about how the room will behave. |
 | **3 · Manager Profiles** | Every modelled number next to where it came from, per manager, plus the raw pre-shrinkage statistics and every pick they have made. Archetype labels are presented as inferred summaries, not as ground truth — a real league has no answer key. |
-| **4 · Draft Room** | The live mock. Status bar, advance one pick / advance to your turn, likely next picks, positional pressure, one card per recommendation lens, survival table with "who takes them", manual override for any pick, board / rosters / runs / save tabs. |
+| **4 · Draft Room** | The live mock. Status bar, advance one pick / advance to your turn, likely next picks, positional pressure, one card per recommendation lens, the two-turn plan (take-now / save-for-next / can-wait, survival at each of your next two picks, and a pick-by-pick forecast of what the room takes in between), manual override for any pick, board / rosters / runs / save tabs. |
 | **5 · Simulations** | Monte Carlo from the current pick, with an optional "best available by ranking" baseline to compare against. Starter-points distribution with 5th/50th/95th percentiles, player frequency, roster shape vs the starting lineup's demand, unfilled slots. |
 | **6 · Analysis** | Review the live draft or any saved one: full board, your picks with reach/fall narrative, where the value went across the room, and every final roster with unfilled-slot and bye-week warnings. |
 | **7 · Settings** | Every weight and constant the model uses, each with a help string describing its *behavioural* effect. Includes a live temperature-curve preview. Applying settings discards cached results, because they were computed under the old weights. |
@@ -219,7 +219,8 @@ engine/                 All simulation logic — never imports Streamlit        
   features.py             Annotates picks with context (rank inversions, runs, fills)
   opponent_model.py       Observation → shrinkage → ManagerProfile → archetype
   pick_model.py           Feature scoring and the softmax over candidates
-  simulator.py            DraftSimulator, availability rollouts, monte_carlo_draft
+  simulator.py            DraftSimulator, availability + two-turn plan rollouts,
+                          monte_carlo_draft
   recommender.py          The eight lenses and their explanations
 models/                 SQLAlchemy schema and the domain objects                 (3,732 loc)
 services/               Import, normalisation, adapters, live providers, storage  (5,148 loc)
