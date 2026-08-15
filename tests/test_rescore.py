@@ -3,7 +3,7 @@
 The bug these tests exist for was silent and expensive. Projections were scored
 once, when the board was fetched, and the points total was the only thing kept — so
 a user who set up a half-PPR league, fetched a board, then corrected their scoring
-to full PPR had a board that *looked* recomputed (tiers, VOR, ceiling and floor all
+to full PPR had a board that *looked* recomputed (VOR, ceiling and floor all
 moved) while the projections underneath it were still half-PPR. The only remedy the
 app could offer was "download the season from ESPN again", which is a network round
 trip to redo arithmetic on numbers already in hand, and which quietly replaces the
@@ -37,7 +37,7 @@ from models.player import Player, PlayerPool, PoolMetadata
 
 # A receiving-heavy stat line per player, so a change in the value of a reception is
 # the loudest possible signal. Receptions differ between players so the pool has a
-# real spread to fit tiers and bands to.
+# real spread to fit replacement level and bands to.
 RECEIVERS: tuple[tuple[str, float, float, float], ...] = (
     # name, receptions, rec_yards, rec_td
     ("Alpha Receiver", 110.0, 1480.0, 11.0),
@@ -270,43 +270,21 @@ def test_per_game_bonuses_are_reported_as_unappliable() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Everything downstream of a projection
 # ─────────────────────────────────────────────────────────────────────────────
-def test_derived_tiers_and_bands_are_re_derived() -> None:
-    """Both are read off the position's projection curve, which has just moved."""
+def test_derived_bands_are_re_derived() -> None:
+    """Read off the position's projection curve, which has just moved."""
     pool = _pool(STANDARD)
-    tiers_before = {p.player_id: p.tier for p in pool}
     ceilings_before = {p.player_id: p.ceiling for p in pool}
-    assert all(p.tier_source for p in pool), "fixture must have derived tiers"
+    assert all(p.outcome_band_source for p in pool), "fixture must have derived bands"
 
     pool.rescore(FULL_PPR)
 
-    assert all(p.tier is not None for p in pool), "a cleared tier must be refilled"
-    assert all(p.tier_source for p in pool), "and re-explained"
     assert all(p.ceiling is not None and p.floor is not None for p in pool)
+    assert all(p.outcome_band_source for p in pool), "and re-explained"
     moved = [
         p.player_id for p in pool
         if p.ceiling != ceilings_before[p.player_id]
     ]
     assert moved, "ceilings are in points, so they must move with the scoring scale"
-    assert tiers_before  # kept for the diff a failure above would want
-
-
-def test_a_tier_this_app_derived_earlier_is_not_trusted_on_the_next_pass() -> None:
-    """The reload bug, and the reason a wrong tier could not be fixed by re-importing.
-
-    Tiers are saved to the database with the board and come back filled in, so a
-    derivation that only fills tiers which are ``None`` kept whatever the last one
-    produced — forever, through every rescore, upload and league change. A real board
-    reloaded that way had the best WR in tier 1 and the second best in tier 4, and
-    nothing the app could do would move them.
-    """
-    pool = _pool(STANDARD)
-    best = max(pool, key=lambda p: float(p.projection))
-    assert best.tier == 1 and best.tier_source, "fixture must have derived tiers"
-    best.tier = 17  # what a stale row from a previous derivation looks like
-
-    pool.rescore(STANDARD)
-
-    assert best.tier == 1, "a tier this app derived has to be re-derived, not believed"
 
 
 def test_re_deriving_an_unchanged_board_changes_nothing() -> None:
@@ -324,7 +302,7 @@ def test_re_deriving_an_unchanged_board_changes_nothing() -> None:
 
     def snapshot() -> dict[str, tuple]:
         return {
-            p.player_id: (p.projection, p.tier, p.ceiling, p.floor, p.risk_score)
+            p.player_id: (p.projection, p.ceiling, p.floor, p.risk_score)
             for p in pool
         }
 
@@ -335,24 +313,22 @@ def test_re_deriving_an_unchanged_board_changes_nothing() -> None:
     assert nobody.projection_imputed, "and an estimate is still labelled as one"
 
 
-def test_a_supplied_tier_or_band_is_not_overwritten() -> None:
+def test_a_supplied_band_is_not_overwritten() -> None:
     """A source's own opinion is not this app's to replace.
 
-    Identifiable because ``tier_source`` and ``outcome_band_source`` are only ever
-    written when this app derived the value.
+    Identifiable because ``outcome_band_source`` is only ever written when this app
+    derived the value.
     """
     opinionated = _receiver("Opinion Holder", 80.0, 1000.0, 7.0, adp=12.0,
                             scoring=STANDARD)
-    opinionated.tier = 9
     opinionated.ceiling = 1234.0
     opinionated.floor = 111.0
     opinionated.risk_score = 0.42
     pool = _pool(STANDARD, extra=[opinionated])
-    assert not opinionated.tier_source and not opinionated.outcome_band_source
+    assert not opinionated.outcome_band_source
 
     pool.rescore(FULL_PPR)
 
-    assert opinionated.tier == 9
     assert opinionated.ceiling == 1234.0
     assert opinionated.floor == 111.0
     assert opinionated.risk_score == 0.42
@@ -373,6 +349,64 @@ def test_value_over_replacement_follows_the_new_projections() -> None:
     assert any(
         abs(float(p.value_over_replacement) - before[p.player_id]) > 1.0 for p in pool
     ), "no VOR moved, so it was not recomputed"
+
+
+def test_vor_is_graded_by_value_and_not_by_rank() -> None:
+    """Regression: ``vor_score`` was a rank percentile, and that is what put kickers
+    in round seven.
+
+    On a real board the best kicker is worth about three points more than the kicker
+    nobody drafts, and the best receiver about a hundred and thirty-five more than his
+    replacement. By *rank* the kicker lands mid-file and scores ~0.44 — close enough to
+    a fringe starter to be taken early. By *value* he scores near zero, which is what
+    he is worth. The board below reproduces that shape: a wide receiver spread and a
+    flat one at kicker.
+    """
+    from core.enums import Position as Pos
+
+    kickers = [
+        Player(
+            player_id=f"k{i}", name=f"Kicker {i}", position=Pos.K,
+            projection=230.0 - i * 0.8, overall_adp=120.0 + i,
+        )
+        for i in range(6)
+    ]
+    league = _league(STANDARD)
+    pool = _pool(STANDARD, league=league, extra=kickers)
+
+    best_receiver = max(pool.by_position(Pos.WR), key=lambda p: p.projection)
+    best_kicker = max(pool.by_position(Pos.K), key=lambda p: p.projection)
+
+    # The premise: the kicker really is the higher-scoring player outright, and that is
+    # precisely why raw projection cannot be trusted to compare across positions.
+    assert best_kicker.projection > best_receiver.projection
+    assert best_kicker.value_over_replacement < best_receiver.value_over_replacement
+
+    assert pool.vor_score(best_receiver) == pytest.approx(1.0)
+    assert pool.vor_score(best_kicker) < 0.2
+
+
+def test_a_player_below_replacement_scores_zero_rather_than_negative() -> None:
+    """Not a gap in the measure but the measure working: past replacement level the
+    position offers nothing a free player would not, and the terms that grade the whole
+    file — projection, platform rank, ADP — are what separate those players."""
+    league = _league(STANDARD)
+    pool = _pool(STANDARD, league=league)
+    worst = min(pool, key=lambda p: p.projection)
+    assert worst.value_over_replacement <= 0.0
+    assert pool.vor_score(worst) == 0.0
+
+
+def test_the_vor_score_stays_inside_zero_and_one_for_every_player() -> None:
+    """The additive utility model needs every term on a comparable scale — a term that
+    ran to 1.4 for one player would silently outrank a whole weight."""
+    league = _league(STANDARD)
+    pool = _pool(STANDARD, league=league)
+    scores = [pool.vor_score(player) for player in pool]
+    assert all(0.0 <= score <= 1.0 for score in scores)
+    # And it is not a constant: something has to separate the board.
+    assert max(scores) == pytest.approx(1.0)
+    assert min(scores) < max(scores)
 
 
 def test_expected_points_tracks_the_projection() -> None:

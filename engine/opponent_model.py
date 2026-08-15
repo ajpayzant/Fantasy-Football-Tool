@@ -120,7 +120,6 @@ class ManagerObservations:
     """
     fill_rate: WeightedStat = field(default_factory=WeightedStat)
     run_continue_rate: WeightedStat = field(default_factory=WeightedStat)
-    tier_cliff_rate: WeightedStat = field(default_factory=WeightedStat)
     rookie_rate: WeightedStat = field(default_factory=WeightedStat)
     stack_rate: WeightedStat = field(default_factory=WeightedStat)
     handcuff_rate: WeightedStat = field(default_factory=WeightedStat)
@@ -210,10 +209,6 @@ def observe_manager(
             observations.rank_inversions.add(float(pick.rank_inversions), weight)
         observations.fill_rate.add(1.0 if pick.filled_starting_slot else 0.0, weight)
         observations.run_continue_rate.add(1.0 if pick.continued_run else 0.0, weight)
-        if pick.same_tier_remaining is not None:
-            observations.tier_cliff_rate.add(
-                1.0 if pick.same_tier_remaining == 0 else 0.0, weight
-            )
         observations.rookie_rate.add(1.0 if pick.is_rookie else 0.0, weight)
         observations.stack_rate.add(1.0 if pick.was_stack else 0.0, weight)
         observations.handcuff_rate.add(1.0 if pick.was_handcuff else 0.0, weight)
@@ -322,13 +317,6 @@ def estimate_parameters(
         out["run_chase"] = (
             _anchor_to_unit(run, estimation.run_continue_anchor),
             observations.run_continue_rate.n,
-        )
-
-    cliff = observations.tier_cliff_rate.mean
-    if cliff is not None:
-        out["tier_sensitivity"] = (
-            _anchor_to_unit(cliff, estimation.tier_cliff_anchor),
-            observations.tier_cliff_rate.n,
         )
 
     for key, stat in (
@@ -518,7 +506,7 @@ def _pooled_observations(
         pooled.seasons = tuple(sorted(set(pooled.seasons) | set(single.seasons)))
         for attribute in (
             "reach", "rank_gap", "rank_inversions", "fill_rate",
-            "run_continue_rate", "tier_cliff_rate", "rookie_rate",
+            "run_continue_rate", "rookie_rate",
             "stack_rate", "handcuff_rate",
         ):
             target: WeightedStat = getattr(pooled, attribute)
@@ -551,7 +539,6 @@ def _archetype_parameter_map(archetype: Archetype) -> dict[str, float]:
         "handcuff_rate": params.handcuff_rate,
         "favorite_team_rate": params.favorite_team_rate,
         "run_chase": params.run_chase,
-        "tier_sensitivity": params.tier_sensitivity,
         "predictability": params.predictability,
         "risk_preference": params.risk_preference,
         "first_qb_round": params.first_qb_round,

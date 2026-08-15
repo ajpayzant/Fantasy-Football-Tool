@@ -2,7 +2,7 @@
 
 Two jobs. First, let the user find and sort players. Second — and the reason this page
 is more than a table — show what the importer *derived*: value over replacement is
-computed from your scoring settings, tiers and ranks may have been imputed, and a
+computed from your scoring settings, ranks may have been imputed, and a
 recommendation that surprises you usually traces back to one of those.
 """
 
@@ -152,14 +152,6 @@ with st.expander("Where every number on this page comes from"):
             "has no data on him — flagged per row.",
         ),
         (
-            "Tier",
-            "Not supplied by anyone: derived here. Within a position, players are "
-            "ordered by projection and a new tier starts wherever the drop to the "
-            "next player is bigger than the average drop plus one standard "
-            "deviation. So a tier break is a gap that is unusual for that position, "
-            "which is why QB and WR tiers come out different sizes.",
-        ),
-        (
             "Ceiling / Floor",
             "The range of value implied by how much drafters disagree about the "
             "player, mapped onto his position's projection curve. **Not a forecast "
@@ -287,7 +279,7 @@ with st.expander("📐 What VOR is, where it comes from, and how much to trust i
     st.markdown(
         "- **Good at**: comparing across positions, and telling you when a position is "
         "genuinely scarce in *your* format rather than in general. It is the reason "
-        "this app will tell you a mid-tier tight end is a better pick than a better-"
+        "this app will tell you a middling tight end is a better pick than a better-"
         "projected receiver.\n"
         "- **Good at**: exposing the flat middle of a position. When twenty running "
         "backs have VOR within ten points of each other, the position is a commodity "
@@ -315,91 +307,42 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────────────────
 # The user's own board
 #
-# Kept on this page rather than in the Draft Room because it is preparation, not a
-# live decision: this is where the user reads the pool and forms the opinions the
-# lists record. The Draft Room then obeys them.
+# Read-only here. The editor used to live on this page, and it moved to **My Board**
+# when uploading a ranking file became possible: two places to set one thing is how a
+# user ends up with a board they did not mean to save, and a file uploader, a paste box
+# and a sortable table do not fit inside an expander on a page whose job is the table
+# below. What stays is the part this page needs — what the board currently says, so the
+# markers in the table have an explanation next to them.
 # ─────────────────────────────────────────────────────────────────────────────
 board = state.user_board()
-with st.expander(
-    f"🎯 Your board — targets, do-not-draft and your own rankings ({board.describe()})",
-    expanded=board.is_empty,
-):
+if board.is_empty:
     st.caption(
-        "These three lists are **yours**, and they change only what this app "
-        "recommends to you. The eleven opponents never see them — they keep drafting "
-        "the players you have sworn off, because that is what they would really do, "
-        "and pretending otherwise would make every availability percentage wrong."
+        "📝 **Your board is empty.** Targets, a never-draft list and your own rankings "
+        "live on **My Board** in the sidebar, and they change only what this app "
+        "recommends to you — the eleven opponents never see them."
     )
-    board_left, board_middle, board_right = st.columns(3)
-    with board_left:
-        st.markdown("**Targets**")
-        st.caption("One per line, best first. The order is the priority.")
-        targets_text = st.text_area(
-            "Targets", value="\n".join(board.targets), height=200,
-            key="board_targets", label_visibility="collapsed",
-            placeholder="Ja'Marr Chase\nBijan Robinson",
-        )
-    with board_middle:
-        st.markdown("**Never draft**")
-        st.caption("Kept out of every suggestion, whatever the model thinks.")
-        avoid_text = st.text_area(
-            "Never draft", value="\n".join(board.avoid), height=200,
-            key="board_avoid", label_visibility="collapsed",
-            placeholder="A player you will not take",
-        )
-    with board_right:
-        st.markdown("**Your own rankings**")
-        st.caption(
-            "Optional and partial is fine — `1. Player` numbering is honoured, plain "
-            "lines take their place in the list."
-        )
-        ranks_text = st.text_area(
-            "Your rankings",
-            value="\n".join(
-                f"{rank}. {name}"
-                for name, rank in sorted(board.custom_ranks.items(), key=lambda kv: kv[1])
-            ),
-            height=200, key="board_ranks", label_visibility="collapsed",
-            placeholder="1. Ja'Marr Chase\n2. Bijan Robinson",
-        )
+else:
+    st.caption(
+        f"📝 **Your board:** {board.describe()} — marked in the table below. "
+        "Edit it on **My Board** in the sidebar."
+    )
 
-    save_column, clear_column, _ = st.columns([1, 1, 3])
-    if save_column.button("Save my board", type="primary", key="board_save"):
-        from services.user_board import UserBoard, parse_names, parse_rankings
-
-        state.set_user_board(UserBoard(
-            targets=parse_names(targets_text),
-            avoid=parse_names(avoid_text),
-            custom_ranks=parse_rankings(ranks_text),
-        ))
-        components.flash("Board saved. It applies to every draft from here on.")
-        st.rerun()
-    if clear_column.button("Clear it", key="board_clear"):
-        from services.user_board import UserBoard
-
-        state.set_user_board(UserBoard())
-        components.flash("Board cleared.")
-        st.rerun()
-
-    if board.conflicts:
-        st.warning(
-            "On both lists, so treated as never-draft: "
-            + ", ".join(board.conflicts)
-            + ". Refusing to draft someone is the safer reading of a contradiction "
-            "than recommending them.",
-            icon="⚠️",
+if board.conflicts:
+    st.warning(
+        "On both your lists, so treated as never-draft: " + ", ".join(board.conflicts),
+        icon="⚠️",
+    )
+_unmatched = board.unmatched(pool)
+if _unmatched:
+    st.warning(
+        "Names on your board that match nobody in this pool, so they do nothing: "
+        + "; ".join(
+            f"**{label.replace('_', ' ')}** — {', '.join(names)}"
+            for label, names in _unmatched.items()
         )
-    unmatched = board.unmatched(pool)
-    if unmatched:
-        st.warning(
-            "These names match nobody in the current player pool, so they do nothing: "
-            + "; ".join(
-                f"**{label.replace('_', ' ')}** — {', '.join(names)}"
-                for label, names in unmatched.items()
-            )
-            + ". Check the spelling, or the player may not be in this file at all.",
-            icon="⚠️",
-        )
+        + ". Fix the spelling on **My Board**.",
+        icon="⚠️",
+    )
 
 st.divider()
 
@@ -511,7 +454,7 @@ if AVAILABLE_PLATFORMS:
             "ranking, so it has no column in the Ranks view."
         )
 
-sort_columns = st.columns([2, 1, 1, 1])
+sort_columns = st.columns([2, 1, 1])
 sort_options = {
     "ADP (earliest first)": ("overall_adp", True),
     "Projection (highest first)": ("projection", False),
@@ -540,9 +483,7 @@ sort_choice = sort_columns[0].selectbox("Sort by", list(sort_options))
 row_limit = sort_columns[1].number_input(
     "Rows to show", min_value=10, max_value=1000, value=100, step=10
 )
-tiers = sorted({int(t) for t in frame["tier"].dropna().tolist()})
-tier_choice = sort_columns[2].multiselect("Tiers", tiers)
-column_set = sort_columns[3].radio(
+column_set = sort_columns[2].radio(
     "Columns",
     ["Value", "ADP by platform", "Ranks by platform"],
     help="All three carry each selected platform's own number. **Value** is the board "
@@ -591,8 +532,6 @@ if rookies_only:
     view = view[view["is_rookie"].fillna(False).astype(bool)]
 if hide_injured:
     view = view[view["injury_status"].astype(str).str.lower().isin({"healthy", "", "nan"})]
-if tier_choice:
-    view = view[view["tier"].isin(tier_choice)]
 if complete_only and selected_adp_columns and "selected_adp_count" in view.columns:
     view = view[view["selected_adp_count"] >= len(selected_adp_columns)]
 
@@ -620,7 +559,7 @@ st.caption(f"{len(view)} of {len(frame)} players match.")
 
 display = view.head(int(row_limit)).rename(columns={
     "player_name": "Player", "position": "Pos", "nfl_team": "Team",
-    "bye_week": "Bye", "tier": "Tier", "projection": "Proj",
+    "bye_week": "Bye", "projection": "Proj",
     "overall_rank": "Rank", "position_rank": "PosRank", "platform_rank": "PlatRank",
     "overall_adp": "ADP", "adp_stdev": "ADP σ",
     "value_over_replacement": "VOR", "ceiling": "Ceiling", "floor": "Floor",
@@ -651,16 +590,16 @@ selected_rank_labels = [PLATFORM_COLUMN_LABELS[c] for c in selected_rank_columns
 # redundant, which is a fair reading. The comparison is real but it is a comparison, so
 # it belongs in the view whose job is comparing.
 VALUE_COLUMNS = [
-    "Player", "Pos", "Team", "Bye", "Tier",
+    "Player", "Pos", "Team", "Bye",
     "ADP", *selected_adp_labels, "Sources",
     "Proj", "VOR", "Ceiling", "Floor", "Risk", "Rookie", "Injury",
 ]
 ADP_PLATFORM_COLUMNS = [
-    "Player", "Pos", "Team", "Tier", "ADP", "Avg ADP", "Avg − blend",
+    "Player", "Pos", "Team", "ADP", "Avg ADP", "Avg − blend",
     *selected_adp_labels, "Sources", "Disagreement", "ADP σ",
 ]
 RANK_PLATFORM_COLUMNS = [
-    "Player", "Pos", "Team", "Tier", "Rank", "Avg rank",
+    "Player", "Pos", "Team", "Rank", "Avg rank",
     *selected_rank_labels, "PosRank", "PlatRank", "Proj", "VOR",
 ]
 wanted = {
@@ -719,7 +658,7 @@ st.dataframe(
         ),
         "My rank": st.column_config.NumberColumn(
             "My rank", format="%d",
-            help="Your own ranking, from the board above. Blank where you have not "
+            help="Your own ranking, from My Board. Blank where you have not "
                  "ranked the player and the consensus order is used instead.",
         ),
         "Risk": st.column_config.ProgressColumn(
@@ -859,9 +798,6 @@ if len(detail_pool):
                 f"**Ceiling {float(row['ceiling']):.1f} / floor "
                 f"{float(row['floor']):.1f}** — {band}"
             )
-        tier_note = str(row.get("tier_source") or "")
-        if tier_note:
-            st.markdown(f"**Tier {int(row['tier'])}** — {tier_note}")
 
 components.download_frame(view, "Download filtered pool (CSV)", "player_pool.csv")
 
@@ -892,41 +828,3 @@ with shape_right:
             )
     components.position_bar_chart(top_vor, "Best VOR available at each position")
 
-with st.expander("Tier structure, and where tiers come from"):
-    st.markdown(
-        "No source publishes tiers, so these are derived here. Within each position, "
-        "players are sorted by projection and the gap to the next player is measured. "
-        "A new tier starts wherever that gap is larger than the average gap **plus half "
-        "a standard deviation** — that is, wherever the drop-off is unusual rather than "
-        "routine. The gaps are measured only across the **draftable** part of the "
-        "position (half again as deep as the replacement rank your league shape "
-        "implies), because the long tail of near-identical projections would otherwise "
-        "drag the threshold below the real spacing between the players you actually "
-        "pick. Everyone past that window shares one replacement-level tier."
-    )
-    st.caption(
-        "Two consequences worth knowing. Positions get different numbers of tiers, "
-        "because both the threshold and the window are computed per position rather "
-        "than fixed. And tiers move when your scoring does: change the scoring preset "
-        "on **Setup** and the projections shift, so the gaps — and the tier breaks — "
-        "shift with them. "
-        "Tiers group players the engine treats as near-interchangeable, and a tier "
-        "about to empty out is what drives the 'last chance' recommendation lens."
-    )
-    breakpoints = sorted({
-        str(p.tier_source) for p in pool if p.tier_source
-    })
-    if breakpoints:
-        st.markdown("**The threshold actually used, per position**")
-        for line in breakpoints:
-            st.caption(f"• {line}")
-    tier_table = (
-        frame.dropna(subset=["tier"])
-        .assign(tier=lambda f: f["tier"].astype(int))
-        .groupby(["tier", "position"])
-        .size().unstack(fill_value=0).sort_index()
-    )
-    if tier_table.empty:
-        st.warning("No tiers in this pool.")
-    else:
-        st.dataframe(tier_table, width="stretch")

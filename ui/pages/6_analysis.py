@@ -102,7 +102,6 @@ frame = pd.DataFrame([
         "team": pick.nfl_team or "",
         "adp": pick.adp_at_pick,
         "projection": pick.projection,
-        "tier": pick.tier,
         "assigned_slot": str(pick.assigned_slot or ""),
         "explanation": pick.explanation,
     }
@@ -135,11 +134,11 @@ with board_tab:
         You=frame["is_user"].map({True: "★", False: ""}),
     )[[
         "Pick", "overall", "manager", "You", "player", "position", "team",
-        "adp", "reach", "tier", "assigned_slot", "explanation",
+        "adp", "reach", "assigned_slot", "explanation",
     ]].rename(columns={
         "overall": "Overall", "manager": "Manager", "player": "Player",
         "position": "Pos", "team": "Team", "adp": "ADP", "reach": "Reach",
-        "tier": "Tier", "assigned_slot": "Filled", "explanation": "Why",
+        "assigned_slot": "Filled", "explanation": "Why",
     })
     st.dataframe(display, width="stretch", hide_index=True, height=460)
     components.download_frame(display, "Download board (CSV)", "draft_analysis.csv")
@@ -175,8 +174,6 @@ with your_tab:
                     caption_bits.append(f"filled {row.assigned_slot}")
                 if not pd.isna(row.projection):
                     caption_bits.append(f"projected {row.projection:.0f}")
-                if not pd.isna(row.tier):
-                    caption_bits.append(f"tier {int(row.tier)}")
                 if row.explanation:
                     caption_bits.append(row.explanation)
                 if caption_bits:

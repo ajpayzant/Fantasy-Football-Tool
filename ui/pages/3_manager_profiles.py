@@ -810,7 +810,7 @@ if history.drafts:
         stat_rows = []
         for field in (
             "reach", "rank_gap", "rank_inversions", "fill_rate", "run_continue_rate",
-            "tier_cliff_rate", "rookie_rate", "stack_rate", "handcuff_rate",
+            "rookie_rate", "stack_rate", "handcuff_rate",
         ):
             stat = getattr(observations, field)
             stat_rows.append({

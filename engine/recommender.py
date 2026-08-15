@@ -76,7 +76,7 @@ SCARCITY_PRESSURE_PICKS: float = 1.5
 """Expected opponent picks at a position before your turn that counts as a run.
 
 Below roughly this, positional demand ahead of you is noise; above it, the
-position is genuinely being drained and the tier you want may not return.
+position is genuinely being drained and the player you want may not return.
 """
 
 UPSIDE_FLOOR_PENALTY: float = 0.35
@@ -315,8 +315,6 @@ def _reason_bullets(
         bullets.append(f"ADP {adp:.1f}")
     if player.projection is not None:
         bullets.append(f"projected {player.projection:.1f}")
-    if player.tier is not None:
-        bullets.append(f"tier {int(player.tier)}")
     slot = view.starting_slot_for(player.position)
     bullets.append(
         f"fills your open {str(slot).upper()} seat" if slot

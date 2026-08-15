@@ -232,7 +232,6 @@ def import_historical_drafts(
             adp=to_float(raw.get("adp")),
             platform_rank=to_float(raw.get("platform_rank")),
             projection=to_float(raw.get("projection")),
-            tier=to_int(raw.get("tier")),
             is_keeper=to_bool(raw.get("keeper_flag")),
             is_rookie=to_bool(raw.get("rookie_flag")),
             bye_week=to_int(raw.get("bye_week")),
@@ -402,7 +401,7 @@ def historical_template() -> pd.DataFrame:
         "manager_name": "Alice", "round": 1, "pick_in_round": 1,
         "overall_pick": 1, "player_name": "Example Player", "position": "RB",
         "nfl_team": "KC", "adp": 2.4, "platform_rank": 1, "projection": 285.0,
-        "tier": 1, "keeper_flag": "N", "rookie_flag": "N", "draft_date": "2025-08-24",
+        "keeper_flag": "N", "rookie_flag": "N", "draft_date": "2025-08-24",
     }
     return pd.DataFrame([example], columns=list(HISTORICAL_IMPORT_COLUMNS))
 
@@ -503,7 +502,6 @@ def import_player_pool(
                 adp_stdev=to_float(raw.get("adp_stdev")),
                 min_pick=to_int(raw.get("min_pick")),
                 max_pick=to_int(raw.get("max_pick")),
-                tier=to_int(raw.get("tier")),
                 ceiling=to_float(raw.get("ceiling")),
                 floor=to_float(raw.get("floor")),
                 risk_score=to_float(raw.get("risk_score")),
@@ -602,7 +600,7 @@ def player_template() -> pd.DataFrame:
         "injury_status": "Healthy", "projection": 285.0, "overall_rank": 1,
         "position_rank": 1, "platform_rank": 1, "overall_adp": 2.4,
         "platform_adp": 2.1, "adp_stdev": 1.5, "min_pick": 1, "max_pick": 6,
-        "tier": 1, "ceiling": 330.0, "floor": 210.0, "risk_score": 0.3,
+        "ceiling": 330.0, "floor": 210.0, "risk_score": 0.3,
         "value_over_replacement": 95.0, "notes": "",
         # Optional, and the only column here that buys something the others cannot:
         # supply the stat line and the app can rescore this player when the league's

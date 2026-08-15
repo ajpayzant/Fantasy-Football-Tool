@@ -115,7 +115,6 @@ def annotate_draft(
     owned_by_team: dict[str, dict[str, set[Position]]] = {}
     """manager_key → NFL team → positions that manager already holds there."""
     recent: list[Position] = []
-    remaining_by_tier = _tier_inventory(picks)
     next_pick_by_manager = _next_pick_lookup(picks)
 
     for pick in picks:
@@ -163,7 +162,6 @@ def annotate_draft(
         pick.picks_until_next = (
             following - pick.overall_pick - 1 if following is not None else None
         )
-        pick.same_tier_remaining = _consume_tier(remaining_by_tier, pick)
         sizes[key] = sizes.get(key, 0) + 1
 
 
@@ -283,45 +281,14 @@ def _next_pick_lookup(
     return out
 
 
-def _tier_inventory(picks: Sequence[HistoricalPick]) -> dict[tuple[Position, int], int]:
-    """How many players of each (position, tier) appear in this draft.
-
-    A within-draft inventory is the only tier count available from history alone:
-    the undrafted remainder of a tier is unknown, so ``same_tier_remaining``
-    counts players in that tier still to be drafted *in this draft*.
-    """
-    inventory: dict[tuple[Position, int], int] = {}
-    for pick in picks:
-        if pick.position is None or pick.tier is None:
-            continue
-        key = (pick.position, int(pick.tier))
-        inventory[key] = inventory.get(key, 0) + 1
-    return inventory
-
-
-def _consume_tier(
-    inventory: dict[tuple[Position, int], int], pick: HistoricalPick
-) -> int | None:
-    """Decrement and return how many of this player's tier remained after them."""
-    if pick.position is None or pick.tier is None:
-        return None
-    key = (pick.position, int(pick.tier))
-    remaining = inventory.get(key)
-    if remaining is None:
-        return None
-    remaining = max(0, remaining - 1)
-    inventory[key] = remaining
-    return remaining
-
-
 def _backfill_from_pool(
     picks: Sequence[HistoricalPick], pool: PlayerPool | None
 ) -> None:
     """Reconcile historical picks against a player pool.
 
     Two jobs. *Fill* what the recap left blank — position, NFL team, and, when the
-    pool describes the same season as the pick, that season's ADP, rank, projection
-    and tier. Only missing fields are filled: a value in the user's file always wins.
+    pool describes the same season as the pick, that season's ADP, rank and
+    projection. Only missing fields are filled: a value in the user's file always wins.
 
     And *undo* an earlier version of this function's cross-season fill. ADP is a fact
     about one August. Read off the 2026 board, a 2025 pick of Ja'Marr Chase says he
@@ -338,8 +305,7 @@ def _backfill_from_pool(
     But a genuine ADP from the user's own file has to survive, so only a value that
     *exactly equals* what this board would have written is dropped — a real 2025 ADP
     agreeing with a 2026 ADP to the last decimal place does not happen. Applied to ADP,
-    rank and projection, which carry enough precision for that test to mean something,
-    and not to ``tier``, where a 2 is a 2 and the coincidence is routine.
+    rank and projection, which carry enough precision for that test to mean something.
 
     ``is_rookie`` is left alone for the same reason in a stronger form: it is a bool,
     so "clear" and "false" are the same value, and blanking it would tell the model
@@ -382,8 +348,6 @@ def _backfill_from_pool(
             pick.platform_rank = player.rank_for()
         if pick.projection is None:
             pick.projection = player.projection
-        if pick.tier is None:
-            pick.tier = player.tier
         if not pick.is_rookie:
             pick.is_rookie = bool(player.is_rookie)
     if picks:

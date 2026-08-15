@@ -73,13 +73,9 @@ _ESTIMATE_TAIL_DECAY = 0.97
 _ESTIMATE_SCALE_TOP = 320.0
 _ESTIMATE_SCALE_BOTTOM = 20.0
 
-# How deep tiers are worth drawing, as a multiple of the position's replacement rank,
-# and the shallowest window worth measuring a gap distribution over.
-_TIER_WINDOW_MULTIPLE = 1.5
-_MIN_TIER_WINDOW = 8
-
-# Team count assumed when tiers are derived before a league has been applied. Matches
-# ``LeagueConfig.team_count``'s own default; applying a league re-derives them anyway.
+# Team count assumed when replacement level is derived before a league has been
+# applied. Matches ``LeagueConfig.team_count``'s own default; applying a league
+# re-derives it anyway.
 _ASSUMED_TEAM_COUNT = 12
 
 
@@ -171,7 +167,6 @@ class Player:
     adp_stdev: float | None = None
     min_pick: int | None = None
     max_pick: int | None = None
-    tier: int | None = None
     ceiling: float | None = None
     floor: float | None = None
     risk_score: float | None = None
@@ -202,7 +197,6 @@ class Player:
     # pool fills in when it imputes.
     projection_source: str = ""
     projection_detail: str = ""
-    tier_source: str = ""
     outcome_band_source: str = ""
 
     # The projected stat line this player's points were computed from, keyed by the
@@ -494,6 +488,7 @@ class PlayerPool:
     __slots__ = (
         "_players", "_by_id", "_by_name", "metadata", "league",
         "_draft_order_hint", "_projection_rank_cache", "_vor_rank_cache",
+        "_best_vor_cache",
     )
 
     def __init__(
@@ -509,6 +504,7 @@ class PlayerPool:
         self.metadata.player_count = len(self._players)
         self._projection_rank_cache: dict[str, float] | None = None
         self._vor_rank_cache: dict[str, float] | None = None
+        self._best_vor_cache: float | None = None
         self._reindex()
         if league is not None:
             self.apply_league(league)
@@ -592,11 +588,11 @@ class PlayerPool:
           supplied only a points total is their number, and guessing at the stats behind
           it to convert it would be inventing data. The return value says how many.
 
-        Derived tiers and outcome bands are cleared pool-wide and re-derived, because
-        both are read off the *position's* projection curve: one player moving changes
-        the curve every player at that position is placed on. Tiers and bands a source
-        supplied are kept — they are identifiable by an empty ``tier_source`` /
-        ``outcome_band_source``, which is only ever written when this app derived them.
+        Derived outcome bands are cleared pool-wide and re-derived, because they are
+        read off the *position's* projection curve: one player moving changes the curve
+        every player at that position is placed on. Bands a source supplied are kept —
+        they are identifiable by an empty ``outcome_band_source``, which is only ever
+        written when this app derived them.
         """
         outcome = RescoreOutcome(
             unscorable_rules=core_stats.unscorable_rules(scoring)
@@ -647,8 +643,8 @@ class PlayerPool:
     def _rederive_from_projections(self) -> None:
         """Re-derive everything that is read off the projection curve.
 
-        Called whenever projections move, by a scoring change or by an upload. Tiers,
-        bands and estimated projections this app derived are discarded and rebuilt on the
+        Called whenever projections move, by a scoring change or by an upload. Bands
+        and estimated projections this app derived are discarded and rebuilt on the
         new scale; ones a *source* supplied are kept. Both of those happen in step 0 of
         :meth:`_impute_core_fields`, which every branch below runs — the point of this
         method is that a caller who moved a projection does not have to know that.
@@ -748,13 +744,13 @@ class PlayerPool:
             return outcome
 
         # Rescore turns the stat lines just written into points, re-derives the
-        # estimated tail on the new scale, and re-derives tiers, bands and VOR. It
-        # leaves points-only players exactly as set above: no stat line and not
-        # imputed is its "left as-is" case.
+        # estimated tail on the new scale, and re-derives bands and VOR. It leaves
+        # points-only players exactly as set above: no stat line and not imputed is
+        # its "left as-is" case.
         outcome.rescore = self.rescore(scoring)
         if not outcome.rescore.changed:
             # Nothing had a stat line, so rescore returned early without re-deriving —
-            # but points-only uploads still moved the board out from under the tiers.
+            # but points-only uploads still moved the board out from under the bands.
             self._rederive_from_projections()
         return outcome
 
@@ -768,22 +764,20 @@ class PlayerPool:
 
         # 0. Throw away everything this app derived last time, to derive it again below.
         #
-        # Projection estimates, tiers and outcome bands are all read off the curve of the
+        # Projection estimates and outcome bands are both read off the curve of the
         # *real* projections on the board, so they only mean anything on the scale those
         # were on — and this method runs again every time that scale can have moved: a
         # league applied, a scoring change, an upload, a saved board reloaded under
         # different scoring rules. Values a *source* supplied are kept, and are told
         # apart by their source line: this app's own estimate says so in
-        # ``projection_source``, and a derived tier or band always leaves a ``…_source``
-        # behind, which nothing else ever writes.
+        # ``projection_source``, and a derived band always leaves an
+        # ``outcome_band_source`` behind, which nothing else ever writes.
         #
-        # Everything here used to be left in place, and both halves misfired. An
-        # estimated projection was mistaken for a real one — step 4 saw a player who
-        # already "had" a projection, cleared his ``projection_imputed`` flag, and from
-        # then on nothing could tell the difference, :meth:`rescore` included. And a
-        # derived tier survived reload, because :meth:`_assign_tiers` only fills tiers
-        # that are ``None``. Between them, a WR the board ranked 134th kept a 286-point
-        # estimate and a WR2 tier through every re-derivation the app could perform.
+        # This used to be left in place, and misfired: an estimated projection was
+        # mistaken for a real one — step 4 saw a player who already "had" a projection,
+        # cleared his ``projection_imputed`` flag, and from then on nothing could tell
+        # the difference, :meth:`rescore` included. A WR the board ranked 134th kept a
+        # 286-point estimate through every re-derivation the app could perform.
         for player in self._players:
             if (
                 player.projection is not None
@@ -791,9 +785,6 @@ class PlayerPool:
             ):
                 player.projection = None
                 player.expected_points = None
-            if player.tier_source:
-                player.tier = None
-                player.tier_source = ""
             if player.outcome_band_source:
                 # All three, not just the ones filled last time: ceiling, floor and risk
                 # are one statement about a player, and half of it left on the old scale
@@ -916,89 +907,10 @@ class PlayerPool:
             if player.bye_week is None:
                 bump(missing, "bye_week")
 
-        self._assign_tiers(imputed)
         self._derive_outcome_bands(imputed)
 
         self.metadata.imputed_fields = imputed
         self.metadata.missing_fields = missing
-
-    def _tier_window(self, position: Position) -> int:
-        """How deep at ``position`` a tier is worth drawing, in players.
-
-        One and a half times replacement level: past the point where a position's value
-        flattens, the players are interchangeable by definition, and one more tier
-        boundary drawn through them says something the board does not support.
-        """
-        if self.league is not None:
-            replacement = self.league.replacement_rank(position)
-        else:
-            replacement = max(
-                1.0,
-                REPLACEMENT_RANK_PER_TEAM.get(position, 1.0) * _ASSUMED_TEAM_COUNT,
-            )
-        return max(_MIN_TIER_WINDOW, int(math.ceil(replacement * _TIER_WINDOW_MULTIPLE)))
-
-    def _assign_tiers(self, imputed: dict[str, int] | None = None) -> None:
-        """Derive tiers from projection gaps for players lacking an explicit tier.
-
-        Within a position, players are ordered by projection and a new tier starts
-        wherever the drop to the next player is unusually large — measured over the
-        *draftable* stretch of that position, and set at half a standard deviation above
-        its mean gap. Everyone below that stretch shares one replacement-level tier.
-
-        The window is what makes the rule work, and its absence is what broke the
-        previous version. Gap statistics taken over a whole position are dominated by
-        its tail: 369 WRs on a live board are 300 of them projected within a point of
-        each other, which pulls the mean gap down to 0.8 points and sets the bar for a
-        tier break at 2.5 — below the 3-to-9-point spacing that separates elite WRs from
-        each other. Every WR worth drafting then broke into a tier of his own (tiers 1
-        through 11 were one player each) and the rest of the position landed in a single
-        blob of 244. Measured over the top 48 instead, the same rule breaks where the
-        position's real cliffs are: Nacua, then Chase, then Smith-Njigba with St. Brown,
-        then Lamb with Jefferson.
-
-        Tier *numbers* are read by the pick model as a strength signal (tier 1 scores
-        four times tier 4), not just displayed, so a position whose top is all
-        singletons does not merely look odd — it prices the players wrong.
-        """
-        by_position: dict[Position, list[Player]] = {}
-        for player in self._players:
-            by_position.setdefault(player.position, []).append(player)
-
-        for position, group in by_position.items():
-            missing = [p for p in group if p.tier is None]
-            if not missing:
-                continue
-            group.sort(key=lambda p: -(p.projection or 0.0))
-            values = np.array([float(p.projection or 0.0) for p in group])
-            if len(values) < 2:
-                for player in group:
-                    player.tier = player.tier or 1
-                continue
-            gaps = np.diff(values) * -1.0  # positive where value drops
-            window = min(self._tier_window(position), len(gaps))
-            inside = gaps[:window]
-            threshold = float(np.mean(inside) + 0.5 * np.std(inside))
-            label = (
-                f"Projection gap breakpoints at {position}: across the top {window + 1} "
-                f"by projection, a new tier starts where the drop to the next player "
-                f"exceeds {threshold:.1f} points (mean gap + ½σ over that group); "
-                f"below them everyone shares one replacement-level tier"
-            )
-            tier = 1
-            group[0].tier = group[0].tier or tier
-            for index in range(1, len(group)):
-                if index <= window:
-                    if threshold > 0 and gaps[index - 1] > threshold:
-                        tier += 1
-                elif index == window + 1:
-                    tier += 1
-                if group[index].tier is None:
-                    group[index].tier = tier
-            for player in missing:
-                player.tier_source = label
-                if imputed is not None:
-                    imputed["tier"] = imputed.get("tier", 0) + 1
 
     def _derive_outcome_bands(self, imputed: dict[str, int] | None = None) -> None:
         """Fill ceiling, floor and risk for players whose source did not supply them.
@@ -1235,11 +1147,40 @@ class PlayerPool:
             return 0.0
         return self._rank_to_percentile(self._projection_rank(player), horizon)
 
-    def vor_percentile(self, player: Player, *, horizon: int | None = None) -> float:
-        """Value-over-replacement standing as 0-1, 1.0 being the most valuable."""
-        if player.value_over_replacement is None:
+    def vor_score(self, player: Player) -> float:
+        """Value over replacement as a share of the best on the board, 0-1.
+
+        Scaled by *value* rather than by rank, unlike every other board term here, and
+        deliberately so: a rank percentile throws away the one thing that makes value
+        over replacement worth computing. On a real board the best kicker is worth
+        about three points more than the kicker nobody drafts, and the best receiver
+        about a hundred and thirty-five more than his replacement — yet by rank the
+        kicker lands near the middle of the file and scores 0.44, close enough to a
+        fringe starter to be taken in round seven. By value he scores 0.03, which is
+        what he is worth.
+
+        Players below replacement level score 0. That is not a gap in the measure but
+        the measure working: past that point the position really does offer nothing
+        another free player would not, and the terms that grade the whole file —
+        projection, platform rank, ADP — are what separate them.
+        """
+        vor = player.value_over_replacement
+        if vor is None:
             return 0.0
-        return self._rank_to_percentile(self._vor_rank(player), horizon)
+        best = self._best_vor()
+        if best <= 0.0:
+            return 0.0
+        return float(max(0.0, min(1.0, float(vor) / best)))
+
+    def _best_vor(self) -> float:
+        """The highest value over replacement on the board (cached)."""
+        if self._best_vor_cache is None:
+            self._best_vor_cache = max(
+                (float(p.value_over_replacement) for p in self._players
+                 if p.value_over_replacement is not None),
+                default=0.0,
+            )
+        return self._best_vor_cache
 
     def _rank_to_percentile(self, rank: float, horizon: int | None = None) -> float:
         """Convert a 1-based rank into a 0-1 score where rank 1 scores 1.0."""
@@ -1251,6 +1192,7 @@ class PlayerPool:
     def _invalidate_caches(self) -> None:
         self._projection_rank_cache = None
         self._vor_rank_cache = None
+        self._best_vor_cache = None
 
     # -- frames ----------------------------------------------------------
     def to_frame(self) -> pd.DataFrame:
@@ -1263,7 +1205,6 @@ class PlayerPool:
                 "position": str(player.position),
                 "nfl_team": player.nfl_team,
                 "bye_week": player.bye_week,
-                "tier": player.tier,
                 "projection": player.projection,
                 "overall_rank": player.overall_rank,
                 "position_rank": player.position_rank,
@@ -1291,7 +1232,6 @@ class PlayerPool:
                 "projection_detail": player.projection_detail,
                 "stat_totals": core_stats.to_frame_value(player.stat_totals),
                 "projection_imputed": player.projection_imputed,
-                "tier_source": player.tier_source,
                 "outcome_band_source": player.outcome_band_source,
                 "notes": player.notes,
             })
@@ -1385,7 +1325,6 @@ def player_from_row(row: Any) -> Player:
         adp_stdev=to_float(val("adp_stdev"), None),
         min_pick=to_int(val("min_pick"), None),
         max_pick=to_int(val("max_pick"), None),
-        tier=to_int(val("tier"), None),
         ceiling=to_float(val("ceiling"), None),
         floor=to_float(val("floor"), None),
         risk_score=to_float(val("risk_score"), None),
@@ -1405,7 +1344,6 @@ def player_from_row(row: Any) -> Player:
         projection_detail=str(val("projection_detail", "") or ""),
         stat_totals=core_stats.from_frame_value(val("stat_totals")),
         projection_imputed=to_bool(val("projection_imputed"), False),
-        tier_source=str(val("tier_source", "") or ""),
         outcome_band_source=str(val("outcome_band_source", "") or ""),
     )
 

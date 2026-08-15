@@ -43,7 +43,7 @@ STANDARD = ScoringRules.from_preset(ScoringPreset.STANDARD)
 HALF_PPR = ScoringRules.from_preset(ScoringPreset.HALF_PPR)
 FULL_PPR = ScoringRules.from_preset(ScoringPreset.FULL_PPR)
 
-# A board wide enough for tiers, replacement level and outcome bands to mean something,
+# A board wide enough for replacement level and outcome bands to mean something,
 # and receiving-heavy so a change in the value of a reception is the loudest signal.
 BOARD: tuple[tuple[str, str, float, float, float], ...] = (
     # name, position, receptions, rec_yards, rec_td
@@ -519,16 +519,15 @@ def test_fill_gaps_mode_replaces_a_projection_estimated_from_draft_position() ->
 # ─────────────────────────────────────────────────────────────────────────────
 # Everything downstream of a projection
 # ─────────────────────────────────────────────────────────────────────────────
-def test_tiers_bands_and_value_over_replacement_follow_the_upload() -> None:
-    """All three are read off the position's projection curve, so all three move.
+def test_bands_and_value_over_replacement_follow_the_upload() -> None:
+    """Both are read off the position's projection curve, so both move.
 
-    A board where a player's projection says one thing and his tier and VOR still
-    reflect the old one is worse than one that was never updated: the row disagrees
-    with itself and there is no way to tell which half is current.
+    A board where a player's projection says one thing and his VOR still reflects
+    the old one is worse than one that was never updated: the row disagrees with
+    itself and there is no way to tell which half is current.
     """
     pool = _pool()
     last = pool.get("foxtrotreceiver_wr")
-    before_tier = last.tier
     before_vor = last.value_over_replacement
     before_ceiling = last.ceiling
 
@@ -541,7 +540,6 @@ def test_tiers_bands_and_value_over_replacement_follow_the_upload() -> None:
     )
 
     updated = pool.get("foxtrotreceiver_wr")
-    assert updated.tier is not None and updated.tier < before_tier
     assert updated.value_over_replacement > before_vor
     assert updated.ceiling != before_ceiling
 
@@ -552,9 +550,8 @@ def test_a_points_only_upload_still_re_derives_the_board() -> None:
     ``rescore`` returns without re-deriving when it had nothing to rescore, which is
     right on its own and wrong here: the projections moved anyway.
     """
-    # Decaying rather than evenly spaced: tiers break where a gap is unusual for the
-    # position, so a straight line puts every player in tier 1 and the test proves
-    # nothing.
+    # Decaying rather than evenly spaced, so replacement level sits on a real slope
+    # and moving one player up it changes his value over replacement measurably.
     plain = [
         Player(
             player_id=f"plain_{index}_wr", name=f"Plain {index}", position=Position.WR,
@@ -564,16 +561,13 @@ def test_a_points_only_upload_still_re_derives_the_board() -> None:
         for index in range(1, 15)
     ]
     pool = PlayerPool(plain, league=_league())
-    before_tier = pool.get("plain_14_wr").tier
     before_vor = pool.get("plain_14_wr").value_over_replacement
-    assert before_tier is not None and before_tier > 1, "fixture must spread over tiers"
 
     result = _apply(pd.DataFrame([{"Player": "Plain 14", "FPTS": 400.0}]), pool)
 
     assert result.outcome is not None and result.outcome.rescore is not None
     assert result.outcome.rescore.changed == 0, "fixture must carry no stat lines"
     updated = pool.get("plain_14_wr")
-    assert updated.tier is not None and updated.tier < before_tier
     assert updated.value_over_replacement > before_vor
 
 

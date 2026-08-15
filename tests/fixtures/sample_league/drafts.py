@@ -19,7 +19,7 @@ predictability and reach statistics differ between managers rather than all
 collapsing to the league mean.
 
 Nothing here is real. Player names come from the generated sample pool, so the
-history joins cleanly to it and the tier / ADP features have data to read.
+history joins cleanly to it and the ADP features have data to read.
 """
 
 from __future__ import annotations
@@ -526,7 +526,6 @@ def sample_history_frame(
                     "adp": chosen["overall_adp"],
                     "platform_rank": chosen["platform_rank"],
                     "projection": chosen["projection"],
-                    "tier": chosen["tier"],
                     "keeper_flag": "N",
                     "rookie_flag": chosen["rookie_flag"],
                     "draft_date": f"{season}-08-26",

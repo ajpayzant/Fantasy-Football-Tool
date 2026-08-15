@@ -305,7 +305,7 @@ class TestSeasonSpecificFieldsStayInTheirSeason:
             [
                 Player(
                     player_id="p1", name="P1", position=Position.RB,
-                    overall_adp=4.7, platform_rank=5.0, projection=250.0, tier=1,
+                    overall_adp=4.7, platform_rank=5.0, projection=250.0,
                 )
             ],
             metadata=PoolMetadata(season=season),
@@ -322,7 +322,7 @@ class TestSeasonSpecificFieldsStayInTheirSeason:
         draft = self._draft(2026)
         annotate_draft(draft, pool=self._board(2026))
         assert draft.picks[0].adp == 4.7
-        assert draft.picks[0].tier == 1
+        assert draft.picks[0].projection == 250.0
 
     def test_a_different_season_board_is_not_used(self) -> None:
         draft = self._draft(2025)

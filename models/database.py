@@ -36,6 +36,7 @@ from sqlalchemy import (
     select,
     text,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -270,7 +271,6 @@ class HistoricalPickRow(Base, TimestampMixin):
     adp = Column(Float, nullable=True)
     platform_rank = Column(Float, nullable=True)
     projection = Column(Float, nullable=True)
-    tier = Column(Integer, nullable=True)
     is_keeper = Column(Boolean, default=False)
     is_rookie = Column(Boolean, default=False)
     bye_week = Column(Integer, nullable=True)
@@ -346,7 +346,6 @@ class PlayerRow(Base, TimestampMixin):
     projection = Column(Float, nullable=True)
     overall_rank = Column(Float, nullable=True)
     position_rank = Column(Integer, nullable=True)
-    tier = Column(Integer, nullable=True)
     ceiling = Column(Float, nullable=True)
     floor = Column(Float, nullable=True)
     risk_score = Column(Float, nullable=True)
@@ -356,15 +355,14 @@ class PlayerRow(Base, TimestampMixin):
     # ── Provenance ───────────────────────────────────────────────────────────
     # Everything below records where a number came from rather than what it is, and
     # all of it used to be dropped on save: a pool saved and reloaded came back with
-    # no per-platform ADP columns, no "where did this projection come from" text, and
-    # every derived tier looking as though the user had supplied it. Schema v2.
+    # no per-platform ADP columns and no "where did this projection come from" text.
+    # Schema v2.
     stat_totals = Column(Text, default="")
     """JSON stat line keyed by :mod:`core.stats` field names. What makes
     :meth:`models.player.PlayerPool.rescore` possible without a refetch."""
     projection_imputed = Column(Boolean, default=False)
     projection_source = Column(Text, default="")
     projection_detail = Column(Text, default="")
-    tier_source = Column(Text, default="")
     outcome_band_source = Column(Text, default="")
     adp_stdev_is_estimated = Column(Boolean, default=False)
     # Per-platform numbers. Kept on the player rather than in ``player_rankings``
@@ -470,7 +468,6 @@ class MockDraftPickRow(Base, TimestampMixin):
     adp_at_pick = Column(Float, nullable=True)
     platform_rank_at_pick = Column(Float, nullable=True)
     projection = Column(Float, nullable=True)
-    tier = Column(Integer, nullable=True)
     pick_probability = Column(Float, nullable=True)
     alternatives = Column(JSON, nullable=True)
     explanation = Column(Text, default="")
@@ -683,7 +680,6 @@ _V2_PLAYER_COLUMNS: tuple[tuple[str, str], ...] = (
     ("projection_imputed", "BOOLEAN"),
     ("projection_source", "TEXT"),
     ("projection_detail", "TEXT"),
-    ("tier_source", "TEXT"),
     ("outcome_band_source", "TEXT"),
     ("adp_stdev_is_estimated", "BOOLEAN"),
     ("ffc_adp", "FLOAT"),
@@ -705,6 +701,42 @@ _V3_SOURCE_COLUMNS: tuple[tuple[str, str], ...] = (
 )
 
 
+# Dropped in schema v4, when tiers were removed from the app. Tiers were derived
+# from projection gaps rather than supplied by any source, so nothing here is data
+# the user can lose — every value in these columns was this app's own arithmetic,
+# and the projections it was computed from are still stored.
+_V4_DROPPED_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("historical_picks", "tier"),
+    ("players", "tier"),
+    ("players", "tier_source"),
+    ("mock_draft_picks", "tier"),
+)
+
+
+def _drop_column_if_present(session: Session, table: str, column: str) -> bool:
+    """Drop a column from an existing table when it is there. Idempotent.
+
+    SQLite has supported ``DROP COLUMN`` since 3.35 and this app requires far newer,
+    but the statement is still guarded: a column left behind is harmless (it is
+    nullable and nothing reads it), so a backend that refuses the drop should not
+    take the whole migration — and the schema version — down with it.
+    """
+    inspector = inspect(session.get_bind())
+    if table not in inspector.get_table_names():
+        return False
+    if column not in {c["name"] for c in inspector.get_columns(table)}:
+        return False
+    try:
+        session.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
+    except SQLAlchemyError:
+        LOGGER.warning(
+            "Migration: could not drop %s.%s; leaving it in place unused", table, column
+        )
+        return False
+    LOGGER.info("Migration: dropped %s.%s", table, column)
+    return True
+
+
 def _migrate(session: Session, from_version: int, to_version: int) -> None:
     """Apply additive migrations between schema versions.
 
@@ -724,7 +756,13 @@ def _migrate(session: Session, from_version: int, to_version: int) -> None:
             for column, ddl_type in _V3_SOURCE_COLUMNS
         )
         LOGGER.info("Migration v3: added %s column(s) to player_data_sources", added)
-    if to_version <= 3:
+    if from_version < 4:
+        dropped = sum(
+            _drop_column_if_present(session, table, column)
+            for table, column in _V4_DROPPED_COLUMNS
+        )
+        LOGGER.info("Migration v4: dropped %s tier column(s)", dropped)
+    if to_version <= 4:
         return
     LOGGER.debug("No migration steps defined for v%s → v%s", from_version, to_version)
 

@@ -45,7 +45,7 @@ def build(team_count: int = 4, rounds: int = 10) -> tuple[LeagueConfig, PlayerPo
             position=position, nfl_team=teams[index % len(teams)],
             overall_adp=adp, platform_adp=adp,
             overall_rank=float(index), platform_rank=float(index),
-            projection=max(1.0, 320.0 - index * 1.6), tier=1 + (index - 1) // 12,
+            projection=max(1.0, 320.0 - index * 1.6),
         ))
     pool = PlayerPool(players, league=config,
                       metadata=PoolMetadata(source="smoke test", is_sample_data=True))

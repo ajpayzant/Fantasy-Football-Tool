@@ -203,7 +203,6 @@ def player_frame(
             "ADP": player.overall_adp,
             "Rank": player.platform_rank or player.overall_rank,
             "Proj": player.projection,
-            "Tier": player.tier,
             "Bye": player.bye_week,
         }
         if pool is not None:

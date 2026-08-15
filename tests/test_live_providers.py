@@ -602,7 +602,6 @@ def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> N
         )
         assert 0.0 <= player.risk_score <= 1.0
         assert player.outcome_band_source, player.name
-        assert player.tier_source or player.tier is not None
 
     widths = [
         (p.ceiling - p.floor) / max(1.0, p.projection or 1.0) for p in pool
@@ -614,7 +613,7 @@ def test_pool_derives_bands_that_bracket_the_projection(recorded, manifest) -> N
 
     # The provenance the Player Pool page reads to explain itself.
     derived = pool.metadata.imputed_fields
-    for field in ("ceiling", "floor", "risk_score", "tier"):
+    for field in ("ceiling", "floor", "risk_score"):
         assert derived.get(field), f"{field} was derived but not recorded as derived"
 
     real = [p for p in pool if "ESPN projected stats" in p.projection_source]
@@ -666,18 +665,16 @@ def test_an_estimated_projection_never_outranks_a_real_one_above_it(
 
 
 @requires_payloads
-def test_tiers_break_where_a_position_has_cliffs_rather_than_per_player(
+def test_no_estimated_projection_reaches_the_top_of_a_position(
     recorded, manifest
 ) -> None:
-    """A tier is a group. One tier per player at the top of a position is not one.
+    """An estimate is a restatement of draft position. It must never lead a position.
 
-    The rule reads gaps in the projection curve, and the statistics it read them against
-    used to be taken over the whole position — 369 WRs, 300 of them projected within a
-    point of each other, which pulled the mean gap to 0.8 points and put the bar for a
-    tier break below the ordinary 3-to-9-point spacing between elite WRs. WR tiers 1
-    through 11 came out one player each and the rest of the position landed in a single
-    tier of 244. Tier numbers are a strength signal the pick model reads, not decoration:
-    tier 1 scores four times tier 4, so that shape mispriced the entire top of the board.
+    Estimates are read off the curve of the *real* projections, and an earlier version
+    read them off a curve that had not been forced to decrease, so a WR the board ranked
+    134th came out with a 286-point estimate — ahead of every genuinely projected
+    receiver. The pick model reads projection as a strength signal, so that one number
+    priced a replacement-level receiver as a second-round pick.
     """
     pool = _live_pool(manifest)
 
@@ -687,25 +684,14 @@ def test_tiers_break_where_a_position_has_cliffs_rather_than_per_player(
             key=lambda p: -(p.projection or 0.0),
         )
         assert len(group) >= 50, f"{position}: only {len(group)} players"
-        tiers = [int(p.tier) for p in group]
-        assert tiers == sorted(tiers), f"{position}: tiers must not improve down the curve"
-        top = tiers[:12]
-        assert len(set(top)) <= 8, (
-            f"{position}: the top 12 span {len(set(top))} tiers — that is a ranking, "
-            f"not a set of tiers"
-        )
-        assert max(tiers) <= 12, f"{position}: {max(tiers)} tiers is a ranking too"
-        # The two halves of the same bug: an estimate that outran the real projections
-        # landed in a top tier, and a rank-134 WR in the WR2 tier is read by the pick
-        # model as a player to take in the second round.
-        top_three = [p for p in group if int(p.tier) <= 3]
-        assert not any(p.projection_imputed for p in top_three), (
+        top = group[:12]
+        assert not any(p.projection_imputed for p in top), (
             f"{position}: "
             + ", ".join(
-                f"{p.name} (tier {p.tier}, board rank {p.overall_rank})"
-                for p in top_three if p.projection_imputed
+                f"{p.name} (board rank {p.overall_rank}, estimated {p.projection})"
+                for p in top if p.projection_imputed
             )
-            + " reached a top tier on an estimated projection"
+            + " leads the position on an estimated projection"
         )
 
 

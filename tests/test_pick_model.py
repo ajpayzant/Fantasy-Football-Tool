@@ -454,6 +454,239 @@ class TestImbalancePenalty:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# League shape: seats, slot fit and useful depth
+#
+# These three read the league's own configuration and are what let the penalties below
+# work in *any* format without a hard-coded 1QB/2RB/2WR/1TE assumption. They are pinned
+# here rather than beside the penalties because when one of them is wrong the penalty
+# looks wrong, and that is a much slower thing to diagnose.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestLeagueShape:
+    def _roster(self, **slots: int) -> RosterSettings:
+        return RosterSettings(slots=dict(slots))
+
+    def test_a_flex_seat_is_shared_by_dedicated_seats_not_evenly(self) -> None:
+        """A RB/WR/TE flex in a 2RB/2WR/1TE lineup is 40/40/20, not 33/33/33.
+
+        The even split is what made a second tight end look like a starter: it credited
+        the TE with a third of a flex seat when the lineup leans on backs and receivers.
+        """
+        seats = self._roster(
+            QB=1, RB=2, WR=2, TE=1, FLEX=1, K=1, DST=1, BENCH=6
+        ).positional_seats()
+        assert seats[Position.RB] == pytest.approx(2.4)
+        assert seats[Position.WR] == pytest.approx(2.4)
+        assert seats[Position.TE] == pytest.approx(1.2)
+        # The seat is shared out entirely — none of it evaporates.
+        assert sum(seats.values()) == pytest.approx(9.0)
+
+    def test_a_superflex_seat_belongs_wholly_to_the_quarterback(self) -> None:
+        """The one format that demands two quarterbacks must not be penalised for it."""
+        roster = self._roster(QB=1, RB=2, WR=2, TE=1, SUPERFLEX=1, BENCH=6)
+        assert roster.positional_seats()[Position.QB] == pytest.approx(2.0)
+        assert roster.useful_depth(Position.QB) >= 2
+
+    def test_a_tight_end_only_half_fills_a_flex_seat(self) -> None:
+        roster = self._roster(QB=1, RB=2, WR=2, TE=1, FLEX=1, K=1, DST=1, BENCH=6)
+        assert roster.slot_fit(Position.RB, Slot.FLEX) == pytest.approx(1.0)
+        assert roster.slot_fit(Position.WR, Slot.FLEX) == pytest.approx(1.0)
+        assert roster.slot_fit(Position.TE, Slot.FLEX) == pytest.approx(0.5)
+        # A dedicated seat is a perfect fit, and an ineligible one is no fit at all.
+        assert roster.slot_fit(Position.TE, Slot.TE) == pytest.approx(1.0)
+        assert roster.slot_fit(Position.QB, Slot.FLEX) == 0.0
+
+    def test_a_te_premium_lineup_makes_the_same_seat_a_full_fit(self) -> None:
+        """Two dedicated TE seats and the flex stops being someone else's seat.
+
+        The point of deriving the number: no special case is needed for a format the
+        author of the penalty never thought about.
+        """
+        roster = self._roster(QB=1, RB=2, WR=2, TE=2, FLEX=1, BENCH=6)
+        assert roster.slot_fit(Position.TE, Slot.FLEX) == pytest.approx(1.0)
+
+    def test_a_one_quarterback_league_has_no_room_for_a_third(self) -> None:
+        deep = self._roster(QB=1, RB=2, WR=2, TE=1, FLEX=1, K=1, DST=1, BENCH=7)
+        assert deep.useful_depth(Position.QB) == 2
+
+    def test_the_ceiling_shrinks_with_the_bench(self) -> None:
+        """A three-seat bench cannot hold the depth a seven-seat bench can."""
+        shallow = self._roster(QB=1, RB=2, WR=2, TE=1, FLEX=1, K=1, DST=1, BENCH=2)
+        deep = self._roster(QB=1, RB=2, WR=2, TE=1, FLEX=1, K=1, DST=1, BENCH=8)
+        assert shallow.useful_depth(Position.RB) < deep.useful_depth(Position.RB)
+
+    def test_a_position_with_no_seat_has_no_useful_depth(self) -> None:
+        """Regression guard: a bench allowance must not invent a seat.
+
+        In a league with no kicker slot, one kicker is not "depth" — it is a wasted
+        roster spot, and the surplus penalty has to see that from pick one.
+        """
+        roster = self._roster(QB=1, RB=2, WR=2, TE=1, BENCH=6)
+        assert roster.positional_seats()[Position.K] == 0.0
+        assert roster.useful_depth(Position.K) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Positional surplus and bench-before-starters
+#
+# The pair added after two simulated teams took three quarterbacks inside seven rounds
+# of a one-QB league, and a third took two tight ends inside five. Neither is a hard
+# cap: both are graded, so an extraordinary player still gets taken.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestPositionalSurplus:
+    def _view(self, roster_settings: RosterSettings):
+        from engine.pick_model import RosterView
+        from models.draft import TeamRoster
+
+        config = LeagueConfig(
+            name="L", season=2026, platform=Platform.ESPN, team_count=10,
+            rounds=16, roster=roster_settings,
+        )
+        roster = TeamRoster(manager_name="M", draft_slot=1, settings=roster_settings)
+        return roster, RosterView(roster, config)
+
+    def _one_qb_league(self) -> RosterSettings:
+        return RosterSettings(
+            slots={
+                Slot.QB: 1, Slot.RB: 2, Slot.WR: 2, Slot.TE: 1,
+                Slot.FLEX: 1, Slot.K: 1, Slot.DST: 1, Slot.BENCH: 7,
+            }
+        )
+
+    def test_nothing_is_charged_while_the_roster_still_has_room(self) -> None:
+        from engine.pick_model import _surplus_penalty
+
+        settings = self._one_qb_league()
+        roster, view = self._view(settings)
+        assert settings.useful_depth(Position.QB) == 2
+        assert _surplus_penalty(_player("qb1", Position.QB, 30.0), view) == 0.0
+        roster.add(_player("qb1", Position.QB, 30.0))
+        # The second quarterback is the backup this bench has room for.
+        assert _surplus_penalty(_player("qb2", Position.QB, 90.0), view) == 0.0
+
+    def test_the_charge_grows_with_each_body_past_the_ceiling(self) -> None:
+        """A third quarterback is a wasted pick and a fourth is an absurdity.
+
+        A flat penalty priced them identically, which is how a roster reached three:
+        each individual pick only ever looked as bad as the one before it.
+        """
+        from engine.pick_model import _surplus_penalty
+
+        roster, view = self._view(self._one_qb_league())
+        roster.add(_player("qb1", Position.QB, 30.0))
+        roster.add(_player("qb2", Position.QB, 90.0))
+        third = _surplus_penalty(_player("qb3", Position.QB, 150.0), view)
+        roster.add(_player("qb3", Position.QB, 150.0))
+        fourth = _surplus_penalty(_player("qb4", Position.QB, 200.0), view)
+        assert third == pytest.approx(1.0)
+        assert fourth > third
+
+    def test_a_surplus_at_one_position_does_not_charge_another(self) -> None:
+        from engine.pick_model import _surplus_penalty
+
+        roster, view = self._view(self._one_qb_league())
+        for i in range(3):
+            roster.add(_player(f"qb{i}", Position.QB, 30.0 + i * 40))
+        assert _surplus_penalty(_player("wr1", Position.WR, 12.0), view) == 0.0
+
+    def test_the_third_quarterback_is_charged_in_a_real_draft_context(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Through ``score_candidate``, where the weight is applied and the sign matters.
+
+        A positive weight must read as *avoid*: the component is subtracted, so it has
+        to come out negative.
+        """
+        context = context_for(state, profiles[1])
+        useful = context.config.roster.useful_depth(Position.QB)
+        quarterbacks = state.available_at_position(Position.QB, limit=useful + 1)
+        for quarterback in quarterbacks[:useful]:
+            context.roster.add(quarterback)
+        surplus = score_candidate(quarterbacks[useful], context).components[
+            "positional_surplus_penalty"
+        ]
+        assert surplus < 0.0
+        assert surplus == pytest.approx(-context.weights.positional_surplus_penalty)
+
+
+class TestBenchBeforeStarters:
+    """Real drafters fill their lineup before they add depth.
+
+    The gap this closed: the roster-imbalance penalty only engages once a manager is
+    running out of picks, which is far too late to explain why nobody takes their second
+    tight end in round five.
+    """
+
+    def _context(self, state: DraftState, profile: ManagerProfile):
+        return context_for(state, profile)
+
+    def test_a_genuine_starter_is_never_charged(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        context = self._context(state, profiles[1])
+        for position in (Position.QB, Position.RB, Position.WR, Position.TE):
+            player = _player(f"start-{position}", position, 10.0)
+            assert score_candidate(player, context).components[
+                "bench_before_starters_penalty"
+            ] == 0.0, position
+
+    def test_a_second_tight_end_is_charged_while_starters_are_missing(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """The complaint verbatim: a team took two tight ends in its first five picks."""
+        context = self._context(state, profiles[1])
+        first = state.available_at_position(Position.TE, limit=2)
+        context.roster.add(first[0])
+        assert score_candidate(first[1], context).components[
+            "bench_before_starters_penalty"
+        ] < 0.0
+
+    def test_the_charge_fades_as_the_lineup_fills(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Depth is the *right* pick once the starters are set, so the term must reach
+        zero rather than merely shrink — otherwise it distorts the late rounds it has
+        no business in."""
+        context = self._context(state, profiles[1])
+        tight_ends = state.available_at_position(Position.TE, limit=2)
+        context.roster.add(tight_ends[0])
+        early = score_candidate(tight_ends[1], context).components[
+            "bench_before_starters_penalty"
+        ]
+        # Fill every seat the term counts as essential.
+        for position, count in (
+            (Position.QB, 1), (Position.RB, 2), (Position.WR, 3),
+        ):
+            for player in state.available_at_position(position, limit=count):
+                context.roster.add(player)
+        refreshed = dataclasses.replace(context, view=None)
+        late = score_candidate(tight_ends[1], refreshed).components[
+            "bench_before_starters_penalty"
+        ]
+        assert early < 0.0
+        assert late == 0.0
+
+    def test_a_kicker_seat_is_not_treated_as_a_hole(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """Leaving the kicker until the end is correct, not a gap in the lineup.
+
+        Counting those seats would make every third receiver look like a luxury pick in
+        round four, which is exactly where real drafts take one.
+        """
+        from engine.pick_model import RosterView
+
+        context = self._context(state, profiles[1])
+        view = RosterView(context.roster, context.config)
+        assert view.open_essential_starters == view.essential_starter_count
+        seats = context.config.roster.starting_slots
+        countable = sum(
+            count for slot, count in seats.items()
+            if slot not in (Slot.K, Slot.DST)
+        )
+        assert view.essential_starter_count == countable
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Softmax
 # ─────────────────────────────────────────────────────────────────────────────
 def _fake_scored(utilities: list[float]) -> list:
@@ -718,20 +951,57 @@ class TestPreferenceSatiation:
     rounds 1, 2 and 3, so he drafted three quarterbacks into a one-QB lineup.
     """
 
-    def test_the_bias_fades_once_the_seat_is_filled(
+    def test_the_bias_is_spent_when_no_useful_depth_remains(
         self, state: DraftState, profiles: dict[int, ManagerProfile]
     ) -> None:
+        """This league seats nine starters behind a single bench spot, so its
+        useful quarterback depth is one. Once that seat is filled the bias has
+        nothing left to buy and must reach *zero* — the old term decayed as
+        1/(1+depth), which never does, and that residue is what bought a
+        second and third quarterback."""
         slot, qui = next(
             (s, p) for s, p in profiles.items()
             if p.manager_name == "Qui Quarterback"
         )
         context = context_for(state, qui, draft_slot=slot)
+        assert context.config.roster.useful_depth(Position.QB) == 1
         quarterback = state.available_at_position(Position.QB, limit=1)[0]
         before = score_candidate(quarterback, context).components[
             "round_specific_preference"
         ]
         assert before > 0.0
 
+        context.roster.add(quarterback)
+        second = state.available_at_position(Position.QB, limit=2)[1]
+        after = score_candidate(second, context).components[
+            "round_specific_preference"
+        ]
+        assert after == 0.0
+
+    def test_the_bias_fades_but_survives_where_a_backup_is_useful(
+        self, state: DraftState, profiles: dict[int, ManagerProfile]
+    ) -> None:
+        """A deep bench does make room for a backup quarterback, so there the
+        bias must shrink rather than vanish: still positive, no longer full."""
+        slot, qui = next(
+            (s, p) for s, p in profiles.items()
+            if p.manager_name == "Qui Quarterback"
+        )
+        deep = dataclasses.replace(
+            state.config,
+            roster=RosterSettings(
+                slots={**state.config.roster.slots, Slot.BENCH: 7}
+            ),
+        )
+        assert deep.roster.useful_depth(Position.QB) == 2
+        context = context_for(state, qui, draft_slot=slot)
+        # view=None so the roster view is rebuilt against the deeper bench; it
+        # caches the config it was constructed with.
+        context = dataclasses.replace(context, config=deep, view=None)
+        quarterback = state.available_at_position(Position.QB, limit=1)[0]
+        before = score_candidate(quarterback, context).components[
+            "round_specific_preference"
+        ]
         context.roster.add(quarterback)
         second = state.available_at_position(Position.QB, limit=2)[1]
         after = score_candidate(second, context).components[

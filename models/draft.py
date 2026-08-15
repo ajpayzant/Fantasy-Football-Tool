@@ -51,7 +51,6 @@ class Pick:
     adp_at_pick: float | None = None
     platform_rank_at_pick: float | None = None
     projection: float | None = None
-    tier: int | None = None
     pick_probability: float | None = None
     """Model probability assigned to this player at this pick (AI picks)."""
     alternatives: list[dict[str, Any]] = field(default_factory=list)
@@ -110,7 +109,6 @@ class Pick:
             "adp_at_pick": self.adp_at_pick,
             "platform_rank_at_pick": self.platform_rank_at_pick,
             "projection": self.projection,
-            "tier": self.tier,
             "pick_probability": self.pick_probability,
             "alternatives": list(self.alternatives),
             "explanation": self.explanation,
@@ -136,7 +134,6 @@ class Pick:
             adp_at_pick=raw.get("adp_at_pick"),
             platform_rank_at_pick=raw.get("platform_rank_at_pick"),
             projection=raw.get("projection"),
-            tier=raw.get("tier"),
             pick_probability=raw.get("pick_probability"),
             alternatives=list(raw.get("alternatives") or []),
             explanation=raw.get("explanation", ""),
@@ -175,7 +172,6 @@ class Pick:
             adp_at_pick=player.adp_for(),
             platform_rank_at_pick=player.rank_for(),
             projection=player.projection,
-            tier=player.tier,
             pick_probability=pick_probability,
             alternatives=[dict(a) for a in alternatives],
             explanation=explanation,
@@ -441,7 +437,6 @@ class HistoricalPick:
     adp: float | None = None
     platform_rank: float | None = None
     projection: float | None = None
-    tier: int | None = None
     is_keeper: bool = False
     is_rookie: bool = False
     bye_week: int | None = None
@@ -470,7 +465,6 @@ class HistoricalPick:
     was_stack: bool = False
     was_handcuff: bool = False
     picks_until_next: int | None = None
-    same_tier_remaining: int | None = None
     position_picks_in_window: int = 0
     historical_pick_id: int | None = None
 
@@ -509,12 +503,12 @@ class HistoricalPick:
         known = {
             "season", "manager_name", "overall_pick", "player_name", "league_name",
             "platform", "round_number", "pick_in_round", "position", "nfl_team",
-            "adp", "platform_rank", "projection", "tier", "is_keeper", "is_rookie",
+            "adp", "platform_rank", "projection", "is_keeper", "is_rookie",
             "bye_week", "draft_date", "adp_delta", "rank_delta", "rank_inversions",
             "position_count_before", "roster_size_before",
             "open_starting_slots_before", "filled_starting_slot", "draft_phase",
             "started_run", "continued_run", "was_stack", "was_handcuff",
-            "picks_until_next", "same_tier_remaining", "position_picks_in_window",
+            "picks_until_next", "position_picks_in_window",
             "historical_pick_id",
         }
         return cls(**{k: v for k, v in raw.items() if k in known})

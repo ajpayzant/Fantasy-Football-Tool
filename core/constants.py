@@ -9,7 +9,7 @@ from __future__ import annotations
 from .enums import Position, Slot
 
 APP_NAME = "League-Aware Fantasy Mock Draft"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 """Bumped whenever the SQLite schema changes; stored in ``application_settings``.
 
 v2 added the provenance columns on ``players`` — the stored stat line a projection
@@ -110,6 +110,30 @@ REPLACEMENT_RANK_PER_TEAM: dict[Position, float] = {
     Position.DST: 1.0,
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# How many *backups* a real roster carries at each position, on top of the
+# starting seats the lineup demands. Used for the useful-depth ceiling that
+# stops a simulated manager stockpiling a position his lineup cannot start.
+# ─────────────────────────────────────────────────────────────────────────────
+BENCH_DEPTH_ALLOWANCE: dict[Position, int] = {
+    Position.QB: 1,
+    Position.RB: 3,
+    Position.WR: 3,
+    Position.TE: 1,
+    Position.K: 0,
+    Position.DST: 0,
+}
+"""Backups worth carrying per position, before the league's bench depth scales it.
+
+Not derivable from slot counts, which is why it is a constant rather than a formula:
+a one-QB league and a one-K league demand exactly one starter each, yet every real
+roster carries a second quarterback and none carries a second kicker. The difference
+is weekly churn — quarterbacks get hurt and benched, kickers get replaced off waivers —
+and only running backs and receivers are churned hard enough to justify three or four
+bodies. Scaled at runtime by how much bench a league actually has: see
+:meth:`core.config.RosterSettings.useful_depth`.
+"""
+
 POSITION_COLORS: dict[str, str] = {
     "QB": "#C7522A",
     "RB": "#2E7D6F",
@@ -126,7 +150,7 @@ POSITION_COLORS: dict[str, str] = {
 HISTORICAL_IMPORT_COLUMNS: tuple[str, ...] = (
     "season", "league_name", "platform", "manager_name", "round",
     "pick_in_round", "overall_pick", "player_name", "position", "nfl_team",
-    "adp", "platform_rank", "projection", "tier", "keeper_flag",
+    "adp", "platform_rank", "projection", "keeper_flag",
     "rookie_flag", "draft_date",
 )
 HISTORICAL_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -137,7 +161,7 @@ PLAYER_IMPORT_COLUMNS: tuple[str, ...] = (
     "player_name", "position", "nfl_team", "bye_week", "experience",
     "rookie_flag", "injury_status", "projection", "overall_rank",
     "position_rank", "platform_rank", "overall_adp", "platform_adp",
-    "adp_stdev", "min_pick", "max_pick", "tier", "ceiling", "floor",
+    "adp_stdev", "min_pick", "max_pick", "ceiling", "floor",
     "risk_score", "value_over_replacement", "notes",
     # Per-platform columns. These must be listed here and not only in the alias
     # table, because ``canonical_column`` consults this set first — which is exactly

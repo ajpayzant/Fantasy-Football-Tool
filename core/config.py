@@ -8,10 +8,12 @@ the engine.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .constants import (
+    BENCH_DEPTH_ALLOWANCE,
     REPLACEMENT_RANK_PER_TEAM,
     SLOT_ELIGIBILITY,
     SLOT_FILL_PRIORITY,
@@ -219,6 +221,113 @@ class RosterSettings:
                 demand[pos] += share
         return demand
 
+    def positional_seats(self) -> dict[Position, float]:
+        """Starting seats per position, flex seats shared by how much each needs one.
+
+        Differs from :meth:`starting_demand` in how a flex seat is split. Splitting it
+        evenly says a RB/WR/TE flex is one-third a tight-end seat, which no real lineup
+        behaves like: the seat goes to whichever position the lineup already leans on,
+        so it is shared in proportion to the *dedicated* seats each position holds. In
+        a 2RB/2WR/1TE lineup that is 40/40/20 rather than 33/33/33, which is the
+        difference between treating a second tight end as a starter and treating him as
+        the backup he is.
+
+        A superflex seat goes wholly to the quarterback, for the reason given in
+        :meth:`useful_depth`. Slots nobody is eligible for contribute nothing.
+        """
+        dedicated: dict[Position, float] = {p: 0.0 for p in Position}
+        shared: list[tuple[frozenset[Position], int]] = []
+        for slot, count in self.starting_slots.items():
+            eligible = SLOT_ELIGIBILITY.get(slot, frozenset())
+            if not eligible:
+                continue
+            if slot is Slot.SUPERFLEX:
+                dedicated[Position.QB] += count
+            elif len(eligible) == 1:
+                dedicated[next(iter(eligible))] += count
+            else:
+                shared.append((eligible, count))
+        seats = dict(dedicated)
+        for eligible, count in shared:
+            weights = {p: dedicated.get(p, 0.0) for p in eligible}
+            total = sum(weights.values())
+            if total <= 0:
+                # Nobody eligible holds a dedicated seat, so the seat really is open
+                # to all of them equally — a flex-only lineup, which is legal.
+                for position in eligible:
+                    seats[position] = seats.get(position, 0.0) + count / len(eligible)
+                continue
+            for position, weight in weights.items():
+                seats[position] = seats.get(position, 0.0) + count * weight / total
+        return seats
+
+    def slot_fit(self, position: Position, slot: Slot) -> float:
+        """How naturally ``position`` fills ``slot``, 0-1.
+
+        1.0 for a seat dedicated to the position, and for any seat the position has
+        as strong a claim on as anyone else. Below 1.0 for a shared seat the position
+        is only the *third* choice for: a RB/WR/TE flex in a 2RB/2WR/1TE lineup is a
+        running back or receiver seat that a tight end may occupy, not a tight-end
+        seat, and treating the two as identical is what let a manager take his second
+        tight end in round five and have the model score it as filling a starter.
+
+        Weighted by dedicated seats, so a TE-premium lineup — which really does start
+        two tight ends — returns 1.0 for the same seat without a special case. A
+        superflex returns 1.0 for everyone eligible, because it is a start-anyone seat
+        by construction.
+        """
+        eligible = SLOT_ELIGIBILITY.get(slot, frozenset())
+        if position not in eligible:
+            return 0.0
+        if len(eligible) == 1 or slot is Slot.SUPERFLEX:
+            return 1.0
+        dedicated = {
+            p: sum(
+                count for s, count in self.starting_slots.items()
+                if SLOT_ELIGIBILITY.get(s, frozenset()) == frozenset({p})
+            )
+            for p in eligible
+        }
+        best = max(dedicated.values())
+        if best <= 0:
+            # No position eligible for this seat has a dedicated one, so none of them
+            # has a better claim than the others.
+            return 1.0
+        return min(1.0, dedicated[position] / float(best))
+
+    def useful_depth(self, position: Position) -> int:
+        """How many of ``position`` a roster can actually use, starters included.
+
+        The ceiling a sane drafter respects. A one-QB lineup can start one
+        quarterback, so the second is a backup and the third is a wasted pick — and
+        without a number saying so, nothing in the pick model does: roster need still
+        scores a backup at half a starter, and a manager with an early-QB tendency
+        spends it three times because the tendency has no idea the seat is taken.
+
+        Seats come from :meth:`positional_seats`, so a TE-premium or WR-heavy lineup
+        shifts the ceiling without a special case. Superflex is the one exception: its
+        seat counts whole toward the quarterback rather than being shared, because that
+        is what fills it in practice, and sharing it would have the model penalising the
+        second quarterback in the one format that demands two.
+
+        On top of the seats sits :data:`core.constants.BENCH_DEPTH_ALLOWANCE`, scaled
+        by how much bench the league carries per starter — a league with three bench
+        seats has no room for the depth a seven-seat bench has, and the ceiling should
+        say so.
+
+        Deliberately not a hard cap: it feeds a graded penalty, so an extraordinary
+        player still gets taken. It is the point past which a pick needs a reason
+        beyond "he was next on my list".
+        """
+        seats = self.positional_seats().get(position, 0.0)
+        if seats <= 0.0:
+            return 0
+        depth_room = min(1.0, self.bench_total / max(1, self.starters_total))
+        allowance = BENCH_DEPTH_ALLOWANCE.get(position, 1) * depth_room
+        # floor(x + 0.5) rather than round(), which rounds halves to even and would
+        # make an exactly-borderline ceiling depend on whether it landed on 2.5 or 3.5.
+        return max(1, int(math.floor(seats + allowance + 0.5)))
+
     def max_for(self, position: Position) -> int | None:
         return self.position_max.get(position)
 
@@ -355,9 +464,40 @@ class ModelWeights:
     """
 
     adp: float = 1.00
-    projection: float = 0.55
-    tier: float = 0.30
-    value_over_replacement: float = 0.45
+    projection: float = 0.30
+    """Weight on raw projected points, as a percentile of the draftable board.
+
+    Deliberately the smaller half of the board-value pair. Raw points are not
+    comparable across positions — on a real board the top sixteen quarterbacks average
+    a 0.93 projection percentile against 0.71 for receivers, purely because passing
+    yardage scores more points than anything else — so this term is a standing +0.1
+    utility bonus on every quarterback in the file. Measured on a live board it was
+    enough to make a *backup* quarterback the highest-utility player available in round
+    six, which is how simulated teams ended up with three of them.
+
+    It is not zero, because within a position it is the most direct statement of how
+    good a player is, and because the cross-position skew is precisely what
+    ``value_over_replacement`` exists to correct.
+    """
+    value_over_replacement: float = 1.00
+    """Weight on points above the last startable player at the same position.
+
+    The cross-position measure, and the larger half of the board-value pair by a wide
+    margin. A quarterback's 300 points and a receiver's 230 are not comparable until
+    both are measured against what the position's replacement gives you free, and this
+    is the only term that does that: on the same board it puts a fringe starting
+    quarterback at a 0.65 percentile where raw projection put him at 0.96, above every
+    receiver alive.
+
+    It carries the weight the ``tier`` term used to hold, because it is the term that
+    said the same thing properly. A tier was a coarse restatement of the projection
+    curve — derived from projection gaps, then read back as a strength signal — and
+    deleting it without moving its weight anywhere left every *non*-board term
+    relatively louder, which measurably worsened the thing it was meant to fix:
+    quarterback doubles inside the first seven rounds went from 10.8% of simulated
+    teams to 17.5%. Reassigning the weight here put them back to 11.7% and took tight
+    end doubles to 5.0%.
+    """
     roster_need: float = 0.70
     positional_scarcity: float = 0.35
     manager_position_preference: float = 0.60
@@ -401,6 +541,26 @@ class ModelWeights:
     it lost to a 0.6 value edge and rosters finished with unfilled K/DST seats.
     """
     positional_limit_penalty: float = 0.80
+    positional_surplus_penalty: float = 1.20
+    """Cost of one body more at a position than the lineup can use, per body.
+
+    Above the widest board-value edge between two candidates so that it decides the
+    pick rather than merely joining the argument, and below
+    ``roster_imbalance_penalty`` because stranding a starting seat is worse than
+    wasting a bench one. Zero for every pick inside a position's useful depth, so it
+    changes nothing about a normally shaped roster: what it stops is the 30% of
+    simulated teams that finished a one-quarterback draft holding three quarterbacks,
+    and the fifth of them that drafted two kickers.
+    """
+    bench_before_starters_penalty: float = 0.90
+    """Cost of adding depth while the starting lineup still has holes, at its worst.
+
+    Graded by how much of the lineup is still empty, so it is near full strength in the
+    early rounds and gone by the time the starters are set. Set below the surplus
+    penalty because it describes a question of *order* rather than of waste — a second
+    tight end in round five is a bad pick, not an impossible one, and an outstanding
+    player should still be able to outbid it, which at this weight he can.
+    """
     premature_kicker_penalty: float = 1.50
     """Cost of taking a kicker or defence early, at its full round-one strength.
 
@@ -527,9 +687,6 @@ class ProfileEstimationConfig:
     run_continue_anchor: float = 0.34
     """Share of picks continuing a positional run for a league-average manager.
     Maps to ``run_chase`` = 0.5."""
-    tier_cliff_anchor: float = 0.18
-    """Share of picks that take the last player of a tier at their position for a
-    league-average manager. Maps to ``tier_sensitivity`` = 0.5."""
     upside_anchor: float = 0.5
     """Share of picks with above-median ceiling that maps to ``risk_preference``
     = 0.5. Only used when the historical file carries ceiling data."""
@@ -724,7 +881,6 @@ class ArchetypeParams:
     favorite_team_rate: float = 0.05
     run_chase: float = 0.5
     """0 = disciplined against positional runs, 1 = chases them."""
-    tier_sensitivity: float = 0.5
     predictability: float = 0.5
     risk_preference: float = 0.5
     """0 = floor-seeking, 1 = ceiling-seeking."""
@@ -743,7 +899,7 @@ ARCHETYPE_PARAMS: dict[Archetype, ArchetypeParams] = {
         label="Best Player Available",
         description="Follows value over need; rarely reaches.",
         need_dependence=0.22, rank_dependence=0.72, reach_mean_picks=-1.5,
-        reach_stdev_picks=6.0, predictability=0.72, tier_sensitivity=0.68,
+        reach_stdev_picks=6.0, predictability=0.72,
     ),
     Archetype.ZERO_RB: ArchetypeParams(
         label="Zero RB",
@@ -794,7 +950,7 @@ ARCHETYPE_PARAMS: dict[Archetype, ArchetypeParams] = {
         label="Platform Rank Follower",
         description="Drafts almost strictly off the platform's default list.",
         rank_dependence=0.95, need_dependence=0.28, reach_mean_picks=-0.5,
-        reach_stdev_picks=3.5, predictability=0.90, tier_sensitivity=0.35,
+        reach_stdev_picks=3.5, predictability=0.90,
     ),
     Archetype.HIGH_VARIANCE: ArchetypeParams(
         label="High Variance",

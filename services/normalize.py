@@ -78,7 +78,6 @@ COLUMN_ALIASES: dict[str, str] = {
     "rookie": "rookie_flag", "is_rookie": "rookie_flag", "rk": "rookie_flag",
     "injury": "injury_status", "status": "injury_status", "inj": "injury_status",
     "risk": "risk_score", "vor": "value_over_replacement", "vorp": "value_over_replacement",
-    "tier_number": "tier", "tier_group": "tier",
 }
 """Loose header → canonical column name. Keys are already snake-cased."""
 

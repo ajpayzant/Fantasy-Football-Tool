@@ -3,9 +3,9 @@
 Realistic *shape*, invented *people*. The point is that every model path the app
 takes has plausible data to run against — positional value curves that actually
 flatten at the right places, ADP uncertainty that widens as you go deeper, real
-tier cliffs, a handful of injuries and suspensions, and boom/bust players whose
+value cliffs, a handful of injuries and suspensions, and boom/bust players whose
 ceiling and floor genuinely diverge. Without those, whole features (the upside
-lens, tier-cliff sensitivity, the injury discount) are structurally unreachable
+lens, positional scarcity, the injury discount) are structurally unreachable
 and a new user would conclude they are broken.
 
 Everything is deterministic: the same seed produces the same pool, so a bug found
@@ -69,7 +69,7 @@ class PositionShape:
     """Points lost per rank at the top of the curve."""
     curve: float
     """Curve exponent. Above 1.0 the drop-off steepens with rank (a cliff after
-    the elite tier); below 1.0 it flattens (a wide, interchangeable middle)."""
+    the elite few); below 1.0 it flattens (a wide, interchangeable middle)."""
     volatility: float
     """Ceiling/floor spread as a share of projection, for the median player."""
     adp_anchor: float
@@ -151,18 +151,6 @@ Sums to 1.0. Used only when the caller asks for a size other than the sum of the
 # ─────────────────────────────────────────────────────────────────────────────
 # Draft-board behaviour
 # ─────────────────────────────────────────────────────────────────────────────
-TIER_SIZES: dict[Position, tuple[int, ...]] = {
-    # Explicit tier boundaries per position, in ranks. The remainder of the pool
-    # falls into a final catch-all tier. Hand-set rather than computed because
-    # tiers are where the cliffs are, and a cliff every N players is not a cliff.
-    Position.QB: (2, 3, 4, 6, 8),
-    Position.RB: (3, 5, 7, 9, 12, 14),
-    Position.WR: (4, 6, 8, 10, 12, 15),
-    Position.TE: (1, 2, 4, 6),
-    Position.K: (3, 5, 7),
-    Position.DST: (3, 5, 7),
-}
-
 ADP_NOISE_SHARE = 0.11
 """Market disagreement about a player, as a share of his expected ADP.
 
@@ -236,15 +224,6 @@ def _position_counts(total: int) -> dict[Position, int]:
     return counts
 
 
-def _tier_for(position: Position, rank: int) -> int:
-    """1-based tier of the ``rank``-th player at a position."""
-    boundaries = TIER_SIZES.get(position, ())
-    for index, edge in enumerate(boundaries, start=1):
-        if rank <= edge:
-            return index
-    return len(boundaries) + 1
-
-
 def _unique_names(rng: random.Random, count: int) -> list[str]:
     """``count`` distinct invented names.
 
@@ -297,7 +276,6 @@ class _Draft:
     ceiling: float
     floor: float
     risk_score: float
-    tier: int
     experience: int
     is_rookie: bool
     injury_status: InjuryStatus
@@ -346,7 +324,6 @@ def _generate(rng: random.Random, total: int) -> list[_Draft]:
                 ceiling=round(ceiling, 1),
                 floor=round(floor, 1),
                 risk_score=round(min(0.95, volatility * 1.4), 3),
-                tier=_tier_for(position, rank),
                 experience=experience,
                 is_rookie=experience == 0,
                 injury_status=status,
@@ -433,7 +410,6 @@ def sample_player_frame(
             "adp_stdev": stdev,
             "min_pick": max(1, int(round(adp - 2.0 * stdev))),
             "max_pick": int(round(adp + 2.6 * stdev)),
-            "tier": draft.tier,
             "ceiling": draft.ceiling,
             "floor": draft.floor,
             "risk_score": draft.risk_score,

@@ -42,7 +42,6 @@ WEIGHT_HELP: dict[str, str] = {
            "and the whole room drafts closer to the ranking list.",
     "projection": "Pull toward raw projected points, independent of where the market "
                   "has the player.",
-    "tier": "Preference for the top of a tier over the bottom of the one above.",
     "value_over_replacement": "Preference for positional scarcity as measured against "
                               "replacement level rather than raw points.",
     "roster_need": "How strongly an unfilled starting slot pulls a manager toward that "
@@ -91,7 +90,6 @@ ESTIMATION_HELP: dict[str, str] = {
     "fill_rate_anchor": "The league-typical rate of filling a starting slot, used as "
                         "the prior for managers with thin history.",
     "run_continue_anchor": "League-typical rate of joining a positional run.",
-    "tier_cliff_anchor": "League-typical rate of taking the last player in a tier.",
     "upside_anchor": "League-typical risk appetite. Above 0.5 = ceiling-chasing.",
     "position_bias_timing_scale": "How much *when* a manager takes a position counts "
                                   "toward their estimated lean.",

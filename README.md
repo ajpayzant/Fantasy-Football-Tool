@@ -112,7 +112,7 @@ parameter carries a provenance label (`observed`, `league fallback`, `baseline`)
 shown in the UI. Recent seasons are weighted more heavily than old ones.
 
 **2. It turns those profiles into a probability distribution over each pick.** Every
-available player is scored against ~20 weighted features (ADP, projection, tier, VOR,
+available player is scored against ~20 weighted features (ADP, projection, VOR,
 roster need, positional scarcity, the manager's own positional lean, run-chasing, stack
 and handcuff preference, injury penalty…), then the scores are converted to pick
 probabilities with a temperature derived from that manager's estimated predictability. A
@@ -140,7 +140,8 @@ of rosters you tend to end up with rather than one draft that happened to go wel
 |---|---|
 | **Home** | What the app is, and a readiness checklist. |
 | **1 · Setup** | Fetch current rankings and ADP (one button, format selectable), connect a Sleeper league to pull your real managers and past drafts, import your own files (league settings / player pool / draft history / keepers), or reload a saved league. Every rejected row is shown with its reason. |
-| **2 · Player Pool** | The board, with provenance: which columns you supplied, which were **estimated** because they were missing, and how VOR was derived from your league's shape. Filters, sorting, CSV export, position/tier charts. |
+| **2 · Player Pool** | The board, with provenance: which columns you supplied, which were **estimated** because they were missing, and how VOR was derived from your league's shape. Filters, sorting, CSV export, position charts. |
+| **My Board** | Your own rankings — upload a CSV/TSV/Excel file, paste a list, or rank players directly against the live board — plus your targets and never-draft list, and a table of where you disagree with the consensus. Only two things are read from a file, the names and the order; the projections in someone else's file stay theirs. Everything here changes what the app recommends **to you** and nothing else: the eleven opponents never see it, because a personal ranking is not a prediction about how the room will behave. |
 | **3 · Manager Profiles** | Every modelled number next to where it came from, per manager, plus the raw pre-shrinkage statistics and every pick they have made. Archetype labels are presented as inferred summaries, not as ground truth — a real league has no answer key. |
 | **4 · Draft Room** | The live mock. Status bar, advance one pick / advance to your turn, likely next picks, positional pressure, one card per recommendation lens, survival table with "who takes them", manual override for any pick, board / rosters / runs / save tabs. |
 | **5 · Simulations** | Monte Carlo from the current pick, with an optional "best available by ranking" baseline to compare against. Starter-points distribution with 5th/50th/95th percentiles, player frequency, roster shape vs the starting lineup's demand, unfilled slots. |
@@ -278,11 +279,11 @@ columns are:
 **Player pool** — `player_name`, `position` required; `nfl_team`, `bye_week`, `experience`,
 `rookie_flag`, `injury_status`, `projection`, `overall_rank`, `position_rank`,
 `platform_rank`, `overall_adp`, `platform_adp`, `adp_stdev`, `min_pick`, `max_pick`,
-`tier`, `ceiling`, `floor`, `risk_score`, `value_over_replacement`, `notes` optional.
+`ceiling`, `floor`, `risk_score`, `value_over_replacement`, `notes` optional.
 
 **Draft history** — `season`, `manager_name`, `player_name` and a pick position
 (`overall_pick`, or `round` + `pick_in_round`) required; `position`, `nfl_team`, `adp`,
-`platform_rank`, `projection`, `tier`, `keeper_flag`, `rookie_flag`, `platform`,
+`platform_rank`, `projection`, `keeper_flag`, `rookie_flag`, `platform`,
 `league_name`, `draft_date` optional.
 
 **Keepers** — `manager_name`, `player_name`, `keeper_round` / `overall_pick`,

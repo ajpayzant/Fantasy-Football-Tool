@@ -300,10 +300,6 @@ class ManagerProfile:
         return _clamp01(self.get("run_chase"))
 
     @property
-    def tier_sensitivity(self) -> float:
-        return _clamp01(self.get("tier_sensitivity"))
-
-    @property
     def predictability(self) -> float:
         return _clamp01(self.get("predictability"))
 
@@ -534,7 +530,7 @@ class ManagerProfile:
 PARAM_KEYS: tuple[str, ...] = (
     "reach_mean_picks", "reach_stdev_picks", "rank_dependence", "need_dependence",
     "rookie_rate", "stack_rate", "handcuff_rate", "favorite_team_rate",
-    "run_chase", "tier_sensitivity", "predictability", "risk_preference",
+    "run_chase", "predictability", "risk_preference",
     "first_qb_round", "first_te_round",
 )
 
@@ -548,7 +544,6 @@ PARAM_LABELS: dict[str, str] = {
     "handcuff_rate": "RB handcuff rate",
     "favorite_team_rate": "Favourite-team selection rate",
     "run_chase": "Chases positional runs",
-    "tier_sensitivity": "Tier-based drafting",
     "predictability": "Predictability",
     "risk_preference": "Upside preference (vs floor)",
     "first_qb_round": "Round of first QB",
@@ -567,7 +562,7 @@ SEASON_SCALED_PARAMS: frozenset[str] = frozenset({
 # Parameters bounded to [0, 1]; others are unbounded/round numbers.
 UNIT_PARAMS: frozenset[str] = frozenset({
     "rank_dependence", "need_dependence", "rookie_rate", "stack_rate",
-    "handcuff_rate", "favorite_team_rate", "run_chase", "tier_sensitivity",
+    "handcuff_rate", "favorite_team_rate", "run_chase",
     "predictability", "risk_preference",
 })
 
@@ -581,7 +576,6 @@ _PARAM_DEFAULTS: dict[str, float] = {
     "handcuff_rate": 0.06,
     "favorite_team_rate": 0.05,
     "run_chase": 0.5,
-    "tier_sensitivity": 0.5,
     "predictability": 0.5,
     "risk_preference": 0.5,
     "first_qb_round": 8.0,
@@ -609,7 +603,6 @@ def apply_archetype_params(
         "handcuff_rate": params.handcuff_rate,
         "favorite_team_rate": params.favorite_team_rate,
         "run_chase": params.run_chase,
-        "tier_sensitivity": params.tier_sensitivity,
         "predictability": params.predictability,
         "risk_preference": params.risk_preference,
         "first_qb_round": params.first_qb_round,

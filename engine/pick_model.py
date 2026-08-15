@@ -331,17 +331,13 @@ def _projection_term(player: Player, pool: PlayerPool, horizon: int) -> float:
     return pool.projection_percentile(player, horizon=horizon)
 
 
-def _vor_term(player: Player, pool: PlayerPool, horizon: int) -> float:
-    """Value over replacement, normalised to 0-1 across the draftable board."""
-    return pool.vor_percentile(player, horizon=horizon)
+def _vor_term(player: Player, pool: PlayerPool) -> float:
+    """Value over replacement as a share of the best on the board.
 
-
-def _tier_term(player: Player, pool: PlayerPool) -> float:
-    """Higher for better tiers, so tier 1 outranks tier 4."""
-    if player.tier is None:
-        return 0.0
-    # Tiers are 1-based and lower is better; map to a decaying 0-1 score.
-    return float(1.0 / (1.0 + max(0, int(player.tier) - 1)))
+    Scaled by value rather than rank — see :meth:`models.player.PlayerPool.vor_score`,
+    which explains why this one term is graded differently from every other.
+    """
+    return pool.vor_score(player)
 
 
 class RosterView:
@@ -369,7 +365,8 @@ class RosterView:
 
     __slots__ = (
         "roster", "config", "board", "pool", "_version", "_filled", "_slot_for",
-        "_seats", "_remaining", "_team_positions", "_open_starters",
+        "_seats", "_remaining", "_team_positions", "_open_starters", "_useful",
+        "_essential_seats", "_open_essential",
     )
 
     def __init__(
@@ -386,6 +383,11 @@ class RosterView:
         self.pool = pool if pool is not None else (board.pool if board else None)
         self._seats: dict[Position, int] = {}
         self._remaining: dict[Position, int] = {}
+        self._useful: dict[Position, int] = {}
+        self._essential_seats = sum(
+            count for slot, count in config.roster.starting_slots.items()
+            if not SLOT_ELIGIBILITY.get(slot, frozenset()) <= LATE_ROUND_POSITIONS
+        )
         self._version = -1
         self._refresh()
 
@@ -393,7 +395,12 @@ class RosterView:
         """Recompute the roster-dependent facts and re-stamp the version."""
         self._version = self.roster.version
         self._filled: dict[Slot, int] = self.roster.filled_starting_slots()
-        self._open_starters: int = sum(self.roster.open_starting_slots().values())
+        open_slots = self.roster.open_starting_slots()
+        self._open_starters: int = sum(open_slots.values())
+        self._open_essential: int = sum(
+            count for slot, count in open_slots.items()
+            if not SLOT_ELIGIBILITY.get(slot, frozenset()) <= LATE_ROUND_POSITIONS
+        )
         self._slot_for: dict[Position, Slot | None] = {}
         self._team_positions: dict[str, set[Position]] = {}
 
@@ -413,6 +420,54 @@ class RosterView:
         self._sync()
         return self._open_starters
 
+    @property
+    def open_essential_starters(self) -> int:
+        """Unfilled starting seats that are not a kicker or defence seat.
+
+        Deferring a kicker to the last round is correct, so those seats must not read
+        as holes in the roster: counting them would make every third receiver look like
+        a luxury pick in round four, which is where real drafts take one.
+        """
+        self._sync()
+        return self._open_essential
+
+    @property
+    def essential_starter_count(self) -> int:
+        """Total such seats, the denominator for "how much of my lineup is empty"."""
+        return self._essential_seats
+
+    def useful_depth(self, position: Position) -> int:
+        """League-shape ceiling on how many of ``position`` are worth holding."""
+        if position not in self._useful:
+            self._useful[position] = self.config.roster.useful_depth(position)
+        return self._useful[position]
+
+    def surplus_at(self, position: Position) -> int:
+        """How many past the useful ceiling one more of ``position`` would leave.
+
+        0 while there is still room, 1 for the pick that goes one past, and upward
+        from there. Reads the *hypothetical* roster — the player being scored is
+        counted — because the question at pick time is what the roster would look like
+        after taking him.
+        """
+        depth = self.roster.count_at(position)
+        return max(0, depth + 1 - self.useful_depth(position))
+
+    def unspent_depth(self, position: Position) -> float:
+        """Share of the useful ceiling at ``position`` still unused, 0-1.
+
+        1.0 when nothing is held, 0.0 once the ceiling is reached. This is what
+        replaced ``1 / (1 + depth)`` in the need and satiation terms: that curve never
+        reached zero, so a third quarterback in a one-quarterback league still scored a
+        third of a starter's need and a positional tendency still had something left to
+        spend.
+        """
+        useful = self.useful_depth(position)
+        if useful <= 0:
+            return 0.0
+        depth = self.roster.count_at(position)
+        return float(max(0.0, min(1.0, (useful - depth) / float(useful))))
+
     def starting_slot_for(self, position: Position) -> Slot | None:
         """First open starting slot this position could fill, or ``None``."""
         self._sync()
@@ -424,6 +479,18 @@ class RosterView:
 
     def fills_starting_slot(self, position: Position) -> bool:
         return self.starting_slot_for(position) is not None
+
+    def starting_fit(self, position: Position) -> float:
+        """How naturally this position fills the seat it would take, 0 if none.
+
+        See :meth:`core.config.RosterSettings.slot_fit`. This is what keeps a tight end
+        who would occupy the flex from scoring as much roster need as the running back
+        the seat is really there for.
+        """
+        slot = self.starting_slot_for(position)
+        if slot is None:
+            return 0.0
+        return self.config.roster.slot_fit(position, slot)
 
     def league_starting_seats(self, position: Position) -> int:
         """Seats league-wide that this position is eligible to fill, per team."""
@@ -467,13 +534,21 @@ def _need_term(player: Player, view: RosterView) -> float:
     1.0 when it fills an empty starting slot, tapering for depth once the
     starters are set. Data-driven via :func:`available_slot_for`, so a superflex
     or TE-premium lineup is handled without special cases.
+
+    Past the position's useful depth it is 0 rather than a small positive number.
+    Depth beyond what a lineup can start is not a lesser version of need, it is the
+    absence of it, and pricing it as need is what let a manager in a one-quarterback
+    league take a second quarterback in round three and a third in round six.
+
+    A seat the position only half fits — a tight end taking the flex — pays half the
+    need, via :meth:`RosterView.starting_fit`.
     """
-    if view.fills_starting_slot(player.position):
-        return 1.0
-    # Starters are covered at this position; depth still has some value, less so
-    # the more of that position they already hold.
-    depth = view.roster.count_at(player.position)
-    return float(1.0 / (1.0 + max(1, depth)))
+    # Starters may be covered at this position; depth still has some value, less so
+    # the more of that position they already hold, and none once the roster holds
+    # as many as it can use.
+    return max(
+        view.starting_fit(player.position), view.unspent_depth(player.position)
+    )
 
 
 def _scarcity_term(player: Player, view: RosterView) -> float:
@@ -522,7 +597,10 @@ def _preference_satiation(player: Player, view: RosterView) -> float:
     one he really wants.
 
     1.0 while a starting seat at the position is still open — the appetite is
-    genuinely unspent — then tapering with each extra body already held.
+    genuinely unspent — then tapering with each extra body already held, and gone
+    entirely once the roster holds as many as the lineup can use. The old
+    ``1 / (1 + depth)`` taper never reached zero, so an early-quarterback manager kept
+    a third of his bias in hand for a third quarterback he could never start.
 
     It scales negative biases too, which is the right behaviour rather than a
     convenient side effect: a zero-RB manager avoids running backs *until* he
@@ -530,9 +608,9 @@ def _preference_satiation(player: Player, view: RosterView) -> float:
     position. Suppressing the taper for avoidance would make him refuse backs all
     draft, which is not what zero-RB means.
     """
-    if view.fills_starting_slot(player.position):
-        return 1.0
-    return float(1.0 / (1.0 + max(0, view.roster.count_at(player.position))))
+    return max(
+        view.starting_fit(player.position), view.unspent_depth(player.position)
+    )
 
 
 def _position_preference_term(
@@ -709,11 +787,67 @@ def _limit_penalty(player: Player, roster: TeamRoster) -> float:
     return 1.0 if roster.at_position_limit(player.position) else 0.0
 
 
+def _surplus_penalty(player: Player, view: RosterView) -> float:
+    """Cost of stockpiling a position past what the lineup can use.
+
+    The sibling of :func:`_limit_penalty`, which only fires on a maximum the user
+    typed in and is therefore off by default. This one is derived from the league's
+    own shape — see :meth:`core.config.RosterSettings.useful_depth` — so a
+    one-quarterback league gets the ceiling it implies without anyone configuring it.
+
+    0 while the roster still has room, then 1.0 for the first pick past the ceiling and
+    growing by one for each further body. Growing rather than flat because a third
+    quarterback is a wasted pick and a fourth is an absurdity, and a flat penalty would
+    price them the same.
+    """
+    return float(view.surplus_at(player.position))
+
+
+def _luxury_penalty(player: Player, view: RosterView) -> float:
+    """Cost of taking a backup while the starting lineup still has holes.
+
+    Real drafters fill their lineup before they add depth, and until now nothing in the
+    model said so: the roster-imbalance penalty only engages once a manager is running
+    out of picks, which is far too late to explain why nobody takes their second tight
+    end in round five. Between those two points sat every pick this model got wrong.
+
+    Scales with how empty the lineup still is, so it is at its strongest in the early
+    rounds — where a backup is least defensible — and fades to nothing once the starters
+    are set, which is exactly when depth becomes the right pick. Kicker and defence
+    seats are excluded from the count, because leaving those until the end is correct
+    rather than a hole: see :attr:`RosterView.open_essential_starters`.
+
+    Full strength at :data:`LUXURY_HOLE_SATURATION` open seats rather than scaled by
+    the whole lineup. One hole is a judgement call — plenty of real drafters take the
+    better player and fill the seat next round — but two says the roster is behind, and
+    dividing by the lineup size made the penalty fade fastest in exactly the rounds
+    where the mistakes were happening: with two seats open out of seven it came to a
+    fifth of its weight, which no backup was ever going to notice.
+
+    Scaled down by how well the pick fills a seat, so it is 0 for a genuine starter and
+    half strength for a tight end taking the flex.
+    """
+    total = view.essential_starter_count
+    if total <= 0:
+        return 0.0
+    open_seats = min(float(view.open_essential_starters), LUXURY_HOLE_SATURATION)
+    pressure = open_seats / LUXURY_HOLE_SATURATION
+    return float(1.0 - view.starting_fit(player.position)) * pressure
+
+
 LATE_ROUND_POSITIONS: frozenset[Position] = frozenset({Position.K, Position.DST})
 """Positions that real drafts leave until the end, near-universally."""
 
 LATE_ROUND_GRACE: int = 3
 """Rounds at the end of a draft where taking a kicker or defence is simply normal."""
+
+LUXURY_HOLE_SATURATION: float = 2.0
+"""Open starting seats at which taking depth instead is fully indefensible.
+
+See :func:`_luxury_penalty`. Two rather than one because taking the better player and
+filling the seat on the next pick is a real strategy with one hole and simply falling
+behind with two.
+"""
 
 
 def _premature_penalty(
@@ -886,9 +1020,8 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
         player, context.overall_pick, context.settings, context.round_number
     )
     components["projection"] = w.projection * _projection_term(player, pool, horizon)
-    components["tier"] = w.tier * _tier_term(player, pool)
     components["value_over_replacement"] = w.value_over_replacement * _vor_term(
-        player, pool, horizon
+        player, pool
     )
     components["roster_need"] = (
         w.roster_need
@@ -944,6 +1077,12 @@ def score_candidate(player: Player, context: PickContext) -> ScoredCandidate:
     components["injury_penalty"] = -w.injury_penalty * _injury_term(player)
     components["positional_limit_penalty"] = -w.positional_limit_penalty * _limit_penalty(
         player, context.roster
+    )
+    components["positional_surplus_penalty"] = -w.positional_surplus_penalty * (
+        _surplus_penalty(player, view)
+    )
+    components["bench_before_starters_penalty"] = -w.bench_before_starters_penalty * (
+        _luxury_penalty(player, view)
     )
     components["premature_kicker_penalty"] = -w.premature_kicker_penalty * (
         _premature_penalty(player, context.round_number, context.config)

@@ -826,8 +826,8 @@ with league_tab:
                 if rescored.changed:
                     st.info(
                         "Rescored this board under the new rules — "
-                        f"{rescored.describe()} Tiers, value over replacement, "
-                        "ceiling and floor were re-derived from the new projections."
+                        f"{rescored.describe()} Value over replacement, ceiling "
+                        "and floor were re-derived from the new projections."
                     )
                 else:
                     # A board with no stored stat lines: an older save, or a user CSV
@@ -1063,8 +1063,8 @@ with players_tab:
     st.markdown("**Load a player pool**")
     st.caption(
         "A ranking or projection export from anywhere you are entitled to use one. "
-        "Only `player_name` and `position` are required — ADP, ranks, projections, "
-        "tiers and bye weeks are all used when present and imputed when absent."
+        "Only `player_name` and `position` are required — ADP, ranks, projections "
+        "and bye weeks are all used when present and imputed when absent."
     )
     with st.expander("Accepted columns"):
         st.code(", ".join(PLAYER_IMPORT_COLUMNS), language="text")

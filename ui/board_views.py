@@ -397,7 +397,6 @@ def top_remaining_frame(
             "Bye": player.bye_week,
             "ADP": player.overall_adp,
             "My rank": board.custom_rank(player),
-            "Tier": player.tier,
             "Proj": player.projection,
             "VOR": player.value_over_replacement,
             "Injury": (

@@ -510,7 +510,6 @@ class DraftState:
             adp_at_pick=player.adp_for(),
             platform_rank_at_pick=player.rank_for(),
             projection=player.projection,
-            tier=player.tier,
             pick_probability=pick_probability,
             alternatives=[dict(a) for a in (alternatives or [])],
             explanation=explanation,
