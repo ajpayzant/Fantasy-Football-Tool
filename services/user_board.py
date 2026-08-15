@@ -32,6 +32,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+import pandas as pd
+
 from models.player import Player, PlayerPool
 from services.normalize import clean_text, player_key
 from services.repository import read_setting, write_setting
@@ -49,9 +51,13 @@ feature being used.
 
 BOARD_FORMAT = 1
 
-MAX_NAMES = 400
-"""Cap per list. Well above any real target list, low enough that a pasted
-spreadsheet of the whole player universe cannot turn every pick into a linear scan.
+MAX_NAMES = 600
+"""Cap per list. Deeper than any draft — a 12-team, 16-round league is 192 players —
+and low enough that a pasted spreadsheet of the whole player universe cannot turn
+every pick into a linear scan. Raised from 400 when uploading a ranking file became
+possible: a published top-300 plus its bench tail runs past 400 with no user error
+involved, and truncating a file the user chose to upload is worse than holding a few
+hundred more names.
 """
 
 _RANK_LINE_RE = re.compile(r"^\s*(\d{1,3})\s*[.):,\-\t]\s*(.+?)\s*$")
@@ -335,6 +341,90 @@ def rankings_from_order(names: Sequence[str]) -> dict[str, int]:
     return {name: index + 1 for index, name in enumerate(_normalise_names(names))}
 
 
+RANK_COLUMN_CANDIDATES: tuple[str, ...] = (
+    "my_rank", "overall_rank", "position_rank", "platform_rank", "overall_adp",
+)
+"""Columns that could carry the user's own ordering, best first.
+
+``overall_adp`` is last and is a deliberate compromise: a file exported from a
+rankings site sometimes has no rank column at all, only the ADP it was sorted by.
+Reading it as a rank is right for the *ordering*, which is the only thing this list
+is used for — the numbers themselves are re-based to 1..n below.
+"""
+
+
+def rankings_from_frame(frame: Any) -> tuple[dict[str, int], list[str]]:
+    """A ranking file → ``({name: 1..n}, notes)``.
+
+    Only two things are needed: which column holds the names, and what order the
+    players are in. Everything else in the file is ignored, because a personal ranking
+    is an ordering and nothing else — projections and ADP in the same file belong to
+    whoever published it, and importing them here would quietly overwrite the board's
+    own numbers with a stranger's.
+
+    Order comes from a rank column when the file has one, and from **row order**
+    otherwise, which is how most exports arrive: sorted, unnumbered. Either way the
+    result is re-based to a dense 1..n, so a file ranked 1-50 and a file ranked
+    3, 17, 92 both come out as a clean ordering.
+
+    ``notes`` explains what was read, for the page to show. A silent import here would
+    be the worst outcome: the user would not know whether their file's third column or
+    its row order decided their board.
+    """
+    from services.normalize import normalize_columns  # local: keeps import cost off boot
+
+    notes: list[str] = []
+    if frame is None or getattr(frame, "empty", True):
+        return {}, ["The file had no rows."]
+    normalised, _ = normalize_columns(frame)
+    if "player_name" not in normalised.columns:
+        return {}, [
+            "No player-name column found. Name it `player_name`, `player` or `name` "
+            "and re-upload."
+        ]
+
+    rank_column = next(
+        (c for c in RANK_COLUMN_CANDIDATES if c in normalised.columns), None
+    )
+    working = normalised
+    if rank_column is not None:
+        numbers = pd.to_numeric(working[rank_column], errors="coerce")
+        if numbers.notna().any():
+            working = working.assign(_order=numbers).sort_values(
+                "_order", na_position="last", kind="stable"
+            )
+            notes.append(f"Ordered by the file's `{rank_column}` column.")
+        else:
+            rank_column = None
+    if rank_column is None:
+        notes.append("No usable rank column, so the file's row order was used.")
+
+    out: dict[str, int] = {}
+    seen: set[str] = set()
+    skipped = 0
+    for raw_name in working["player_name"].tolist():
+        name = clean_text(raw_name)
+        key = player_key(name)
+        if not name or not key:
+            continue
+        if key in seen:
+            skipped += 1
+            continue
+        seen.add(key)
+        out[name] = len(out) + 1
+        if len(out) >= MAX_NAMES:
+            break
+    if skipped:
+        notes.append(f"{skipped} duplicate name(s) kept once, at their first position.")
+    if len(working) > MAX_NAMES:
+        notes.append(
+            f"Only the first {MAX_NAMES} players were kept — that is the cap on a "
+            f"board, and it is deeper than any draft."
+        )
+    notes.append(f"Read {len(out)} ranked player(s).")
+    return out, notes
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
@@ -371,6 +461,7 @@ def clear_board() -> None:
 
 __all__ = [
     "UserBoard", "EMPTY_BOARD", "BOARD_KEY", "BOARD_FORMAT", "MAX_NAMES",
-    "parse_names", "parse_rankings", "rankings_from_order",
+    "parse_names", "parse_rankings", "rankings_from_order", "rankings_from_frame",
+    "RANK_COLUMN_CANDIDATES",
     "save_board", "load_board", "clear_board",
 ]

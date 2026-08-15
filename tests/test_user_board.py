@@ -27,9 +27,11 @@ from models.league import League
 from models.manager import Manager, ManagerProfile
 from models.player import PlayerPool
 from services.user_board import (
+    MAX_NAMES,
     UserBoard,
     parse_names,
     parse_rankings,
+    rankings_from_frame,
     rankings_from_order,
 )
 
@@ -211,6 +213,110 @@ class TestParsing:
         assert rankings_from_order(["Alpha Back", "Bravo Back"]) == {
             "Alpha Back": 1, "Bravo Back": 2,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reading a ranking file
+#
+# Two things are needed from an uploaded file and no more: which column holds the
+# names, and what order the players are in. Everything else is ignored on purpose —
+# the projections and ADP in someone else's file are theirs, and importing them here
+# would quietly overwrite the board's own numbers with a stranger's.
+# ─────────────────────────────────────────────────────────────────────────────
+class TestReadingARankingFile:
+    def _frame(self, data: dict) -> "pd.DataFrame":
+        import pandas as pd
+
+        return pd.DataFrame(data)
+
+    def test_a_rank_column_decides_the_order(self) -> None:
+        ranks, notes = rankings_from_frame(
+            self._frame({"Player": ["Bravo Back", "Alpha Back"], "Rank": [2, 1]})
+        )
+        assert ranks == {"Alpha Back": 1, "Bravo Back": 2}
+        assert any("Rank" in note or "rank" in note for note in notes)
+
+    def test_the_numbers_are_re_based_to_a_dense_ordering(self) -> None:
+        """A published file ranked 3, 17, 92 is an ordering, not three ranks. Keeping
+        its numbers would leave the user's #92 sorting behind a consensus #40 who is
+        genuinely worse in their own opinion."""
+        ranks, _ = rankings_from_frame(
+            self._frame({
+                "player_name": ["Alpha Back", "Bravo Back", "Charlie Back"],
+                "overall_rank": [3, 17, 92],
+            })
+        )
+        assert ranks == {"Alpha Back": 1, "Bravo Back": 2, "Charlie Back": 3}
+
+    def test_row_order_is_used_when_there_is_no_rank_column(self) -> None:
+        """How most exports actually arrive: sorted, unnumbered."""
+        ranks, notes = rankings_from_frame(
+            self._frame({"Player": ["Bravo Back", "Alpha Back"]})
+        )
+        assert ranks == {"Bravo Back": 1, "Alpha Back": 2}
+        assert any("row order" in note for note in notes)
+
+    def test_an_unusable_rank_column_falls_back_to_row_order(self) -> None:
+        """A column of text where numbers were expected is a real export, not a fake:
+        "1st", "-", "NR". Failing the whole upload over it would be the wrong call."""
+        ranks, notes = rankings_from_frame(
+            self._frame({
+                "Player": ["Bravo Back", "Alpha Back"],
+                "overall_rank": ["NR", "-"],
+            })
+        )
+        assert ranks == {"Bravo Back": 1, "Alpha Back": 2}
+        assert any("row order" in note for note in notes)
+
+    def test_a_duplicate_is_kept_once_at_its_first_position(self) -> None:
+        ranks, notes = rankings_from_frame(
+            self._frame({
+                "Player": ["Alpha Back", "Bravo Back", "A.J. Brown", "AJ Brown"],
+            })
+        )
+        assert ranks == {"Alpha Back": 1, "Bravo Back": 2, "A.J. Brown": 3}
+        assert any("duplicate" in note for note in notes)
+
+    def test_a_missing_name_column_is_reported_rather_than_raised(self) -> None:
+        """The failure has to name the fix. A silent empty result would look like the
+        upload worked and the file was empty."""
+        ranks, notes = rankings_from_frame(self._frame({"Rank": [1, 2], "Pts": [9, 8]}))
+        assert ranks == {}
+        assert any("player_name" in note for note in notes)
+
+    def test_an_empty_file_says_so(self) -> None:
+        import pandas as pd
+
+        assert rankings_from_frame(pd.DataFrame()) == ({}, ["The file had no rows."])
+        assert rankings_from_frame(None) == ({}, ["The file had no rows."])
+
+    def test_nothing_but_the_names_and_the_order_is_imported(self) -> None:
+        """A file's projections belong to whoever published it."""
+        ranks, _ = rankings_from_frame(
+            self._frame({
+                "Player": ["Alpha Back", "Bravo Back"],
+                "Projection": [999.0, 1.0],
+                "Team": ["SF", "GB"],
+            })
+        )
+        assert ranks == {"Alpha Back": 1, "Bravo Back": 2}
+
+    def test_the_file_is_capped_at_the_length_of_a_board(self) -> None:
+        ranks, notes = rankings_from_frame(
+            self._frame({"Player": [f"Player {i}" for i in range(MAX_NAMES + 40)]})
+        )
+        assert len(ranks) == MAX_NAMES
+        assert max(ranks.values()) == MAX_NAMES
+        assert any(str(MAX_NAMES) in note for note in notes)
+
+    def test_what_it_produces_is_a_board_the_app_can_use(self) -> None:
+        """The parser's output has to survive ``UserBoard``, which re-validates it."""
+        ranks, _ = rankings_from_frame(
+            self._frame({"Player": ["Bravo Back", "Alpha Back"], "Rank": [2, 1]})
+        )
+        board = UserBoard(custom_ranks=ranks)
+        assert board.custom_ranks == {"Alpha Back": 1, "Bravo Back": 2}
+        assert not board.is_empty
 
 
 # ─────────────────────────────────────────────────────────────────────────────

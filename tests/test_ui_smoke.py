@@ -40,7 +40,7 @@ PAGES = ROOT / "ui" / "pages"
 # page whose imports nobody checks until a user clicks the tab.
 COVERED_PAGES = {
     "1_setup.py", "2_player_pool.py", "3_manager_profiles.py", "4_draft_room.py",
-    "5_simulations.py", "6_analysis.py", "7_settings.py",
+    "5_simulations.py", "6_analysis.py", "7_settings.py", "8_my_rankings.py",
 }
 
 # Generous: a page that builds profiles or runs rollouts does real work, and a
@@ -144,6 +144,7 @@ def test_every_registered_page_is_covered_by_these_tests() -> None:
     "5_simulations.py",
     "6_analysis.py",
     "7_settings.py",
+    "8_my_rankings.py",
 ])
 def test_page_renders_with_data_loaded(page: str, loaded) -> None:
     app = _app(page, loaded, with_draft=30).run()
@@ -503,6 +504,7 @@ def test_settings_page_works_with_nothing_loaded() -> None:
     "4_draft_room.py",
     "5_simulations.py",
     "6_analysis.py",
+    "8_my_rankings.py",
 ])
 def test_sample_data_is_labelled_on_every_page(page: str, loaded) -> None:
     """A product requirement, and the reason the banner is per-page rather than shown

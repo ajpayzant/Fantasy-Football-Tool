@@ -100,9 +100,15 @@ _TRAIL_HINTS: dict[str, str] = {
 # One place mapping a page title to its file, used both by the navigation below and
 # by the landing page's buttons. Two lists would drift, and a stale path here is a
 # crash on click rather than a visible mistake.
+#
+# The order here is the sidebar order. It is *not* the filename numbering for My Board,
+# which was added last and so carries an 8: it belongs next to the Player Pool, because
+# both answer "who is on the board and what do I think of them", and a user who has just
+# imported a pool is exactly the user about to paste their own rankings over it.
 _PAGE_FILES: dict[str, str] = {
     "Setup": "ui/pages/1_setup.py",
     "Player Pool": "ui/pages/2_player_pool.py",
+    "My Board": "ui/pages/8_my_rankings.py",
     "Manager Profiles": "ui/pages/3_manager_profiles.py",
     "Draft Room": "ui/pages/4_draft_room.py",
     "Simulations": "ui/pages/5_simulations.py",
@@ -110,7 +116,7 @@ _PAGE_FILES: dict[str, str] = {
     "Settings": "ui/pages/7_settings.py",
 }
 _PAGE_ICONS: dict[str, str] = {
-    "Setup": "⚙️", "Player Pool": "📋", "Manager Profiles": "🕵️",
+    "Setup": "⚙️", "Player Pool": "📋", "My Board": "📝", "Manager Profiles": "🕵️",
     "Draft Room": "🎯", "Simulations": "🎲", "Analysis": "📊", "Settings": "🔧",
 }
 
@@ -208,7 +214,7 @@ def landing() -> None:
             """
             1. **Setup** — fetch current rankings and ADP, connect your Sleeper league,
                paste a draft recap from any platform, or import your own files.
-            2. **Player Pool** — the board: projections, ADP from each platform, tiers,
+            2. **Player Pool** — the board: projections, ADP from each platform,
                and where every number came from.
             3. **Manager Profiles** — build the opponent models, see what was inferred,
                and tell the model what you know that the history does not show.
